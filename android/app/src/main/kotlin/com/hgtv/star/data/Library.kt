@@ -303,6 +303,20 @@ class Library(context: Context) {
     var danmakuSpeed: DanmakuSpeed
         get() = state().settings.danmakuSpeed
         set(value) { if (value != danmakuSpeed) { state().settings = state().settings.copy(danmakuSpeed = value); put("danmakuSpeed", value.storedValue) } }
+    /**
+     * 播放界面的按键绑定（上 / 下 / 左 / 右 / 菜单 / 确定）。
+     *
+     * 只存改过的键（见 [KeyMap.encode]），因此默认状态下磁盘上就是一个空串；
+     * 改一次就落一次盘，下一部剧、下一次开应用都还是这一套手感。
+     */
+    var keyMap: KeyMap
+        get() = KeyMap.decode(state().settings.keys)
+        set(value) {
+            val next = value.encode()
+            if (next == keyMap.encode()) return
+            state().settings = state().settings.copy(keys = next)
+            put("keymap", next)
+        }
     fun snapshot() = state().snapshot()
     fun restore(incoming: BackupData, restoreSettings: Boolean) {
         val merged = LibraryBackup.merge(snapshot(), incoming, restoreSettings)
@@ -312,7 +326,8 @@ class Library(context: Context) {
             "autoNext" to { merged.settings.autoNext },
             "frameMode" to { merged.settings.frame.name }, "danmakuMode" to { merged.settings.danmaku.storedValue },
             "danmakuScale" to { merged.settings.danmakuScale }, "danmakuAlpha" to { merged.settings.danmakuAlpha },
-            "danmakuSpeed" to { merged.settings.danmakuSpeed.storedValue }))
+            "danmakuSpeed" to { merged.settings.danmakuSpeed.storedValue },
+            "keymap" to { merged.settings.keys }))
         flush()
     }
     /** Requests prompt background commit, without lifecycle-thread disk waits. */

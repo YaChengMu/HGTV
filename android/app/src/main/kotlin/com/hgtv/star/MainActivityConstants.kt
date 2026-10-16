@@ -170,6 +170,15 @@ internal const val MAX_CATALOG_PAGE=100
 internal const val THEME_GRID_COLUMNS=4
 
 /**
+ * 设置页「按键设置」那一栏一行放几格。
+ *
+ * 六个键（上 / 下 / 左 / 右 / 菜单 / 确定）排成两列三行：每一格都要写出「键名 · 当前动作」，
+ * 一行放四格（跟着主题网格走）只会把文案挤成省略号，而两列正好让「上 / 下」「左 / 右」
+ * 「菜单 / 确定」各自成行——用户找某一个键时按它旁边的那个键去数就行。
+ */
+internal const val KEY_GRID_COLUMNS=2
+
+/**
  * 播放设置面板的行号。
  *
  * 面板里好几处「改完就地重画这一行、再把焦点按回同一格」的调用都按行号寻址，
@@ -201,3 +210,15 @@ internal fun sleepRow(showsStyle: Boolean)=if(showsStyle) MENU_ROW_ALPHA+1 else 
  * key 里带着搜索词与页码，用户每搜一个新词就是一个新 key，不设上限就是一条只涨不跌的内存曲线。
  */
 internal const val SCROLL_MEMORY=24
+
+/**
+ * 首页「再按一次退出」的确认窗口。
+ *
+ * 第一次按返回只弹一条提示并记下时刻，窗口内再按一次才真的退出；超时之后再按就重新算第一次
+ * （提示也再弹一遍）。取 2 秒是为了和 [TvTools.toast] 的显示时长（1.9 秒）对齐：
+ * 提示还在屏幕上时按第二次一定算数，用户不必去猜「几秒内有效」。
+ */
+internal const val EXIT_CONFIRM_WINDOW_MS=2000L
+
+/** 首页按第一次返回时的提示（走 [TvTools.toast]，不吃焦点、不吃按键）。 */
+internal const val EXIT_TOAST="再按一次返回键退出"

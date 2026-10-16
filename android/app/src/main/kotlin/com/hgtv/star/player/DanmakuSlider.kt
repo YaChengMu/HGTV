@@ -69,18 +69,26 @@ internal class DanmakuSlider(
      * 左右键由控件自己消化：`onKeyDown` 比焦点导航先执行，
      * 这里返回 true 就等于告诉框架「这一下不用找下一个焦点了」。
      * 确认键也吃掉，避免点下去触发按钮的空动作。
+     *
+     * **已经顶到两端时不吃**：这一下没改任何值，让给焦点系统，用户才能横着离开这一格。
+     * 播放设置面板里两条滑块的左右出口都指回自己，因此那里照旧停在原地；
+     * 设置页的弹幕栏里，滑块左边就是「弹幕显示 / 弹幕速度」，按左能真的回到那一格。
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = when (keyCode) {
-        KeyEvent.KEYCODE_DPAD_LEFT -> { nudge(-1); true }
-        KeyEvent.KEYCODE_DPAD_RIGHT -> { nudge(1); true }
+        KeyEvent.KEYCODE_DPAD_LEFT -> nudge(-1)
+        KeyEvent.KEYCODE_DPAD_RIGHT -> nudge(1)
         KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> true
         else -> super.onKeyDown(keyCode, event)
     }
 
-    private fun nudge(direction: Int) {
+    /** 调一档；返回「值真的变了」——顶到两端时返回 false（见 [onKeyDown]）。 */
+    private fun nudge(direction: Int): Boolean {
+        val before = value
         val index = Math.round((value - min) / step) + direction
         value = min + index * step
+        if (value == before) return false
         onValue(value)
+        return true
     }
 
     override fun onDraw(canvas: Canvas) {

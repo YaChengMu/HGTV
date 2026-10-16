@@ -148,6 +148,13 @@ class MainActivity: Activity() {
      */
     internal var collection: String?=null
     /**
+     * 首页「再按一次退出」第一次按下的时刻（`SystemClock.elapsedRealtime()`；0 = 没按过）。
+     *
+     * 只记时刻、不记布尔：第二次按下是否算数由「距上一次是否超过 [EXIT_CONFIRM_WINDOW_MS]」
+     * 判定，因此不需要额外的定时器去复位——超时之后的下一按自然就是新的第一次。
+     */
+    internal var exitArmedAt=0L
+    /**
      * 「我的」页当前看的那一栏（[ACCOUNT_TABS] 的 key）。
      *
      * 默认是**第一栏「历史」**（与芯片顺序一致）：进这一页时用户最常看的是「我看到哪了」，
@@ -729,12 +736,12 @@ class MainActivity: Activity() {
             "player" -> if(playbackMenu!=null || (hud.visibility==View.VISIBLE && !playError)) hidePlaybackOverlay() else returnToDetail()
             "detail" -> showCatalog()
             // 品牌不再是按钮，返回键就是唯一的「回主界面」入口：集合页回到它所在的标签（首页），
-            // 搜索 / 排行榜 / 设置直接切回首页；已经在首页时再按就是**退出确认**。
+            // 搜索 / 排行榜 / 设置直接切回首页；已经在首页时再按就是**退出**（按两次，见 [confirmExit]）。
             //
             // 首页那一下不再先把焦点搬到顶部入口：那一步只是把焦点挪到「搜索」图标上，用户读到的
             // 是「按返回焦点乱跑」；页头收起时那一行的高度是 0，焦点请求根本没有可见的落点，
             // 连下一次「焦点在入口上」的判断都成立不了——表现出来就是「按多少次返回都没反应、
-            // 也弹不出退出框」。因此首页的返回一律直接弹退出确认。
+            // 也退不出去」。因此首页的返回一律直接走「再按一次退出」。
             else -> when {
                 collection!=null -> { collection=null; catalogFocus=""; showCatalog() }
                 tab!=TAB_HOME -> switchTab(TAB_HOME)
@@ -743,15 +750,23 @@ class MainActivity: Activity() {
         }
     }
     /**
-     * 主界面按返回不再直接退出：先弹一个确认框，确认后才 finish。
-     * 弹窗走全站统一的 [TvDialog]，焦点默认落在「取消」上，误按返回键不会退出应用；
-     * 取消后焦点回到首页入口，再按返回才会重新弹出。
+     * 主界面按返回的退出：**按两次**——第一次只弹一条提示，[EXIT_CONFIRM_WINDOW_MS] 之内
+     * 再按一次才 [finish]。
+     *
+     * 不再弹确认框：电视上没有指针，确认框每次都要用户把焦点从「取消」挪到「退出」，
+     * 比再按一下返回慢；而「再按一次退出」是 Android 上最熟的手势，第一次的提示已经把
+     * 「要按两次」说清楚了。退出前也不需要再确认一遍数据：本机记录每次改动都即时落盘，
+     * 播放进度在上屏 / 退出播放时已经写过（见 [saveProgress]）。
      */
     private fun confirmExit() {
-        // 弹窗关掉之后焦点回到「按返回之前待着的地方」：优先当前焦点（内容里的卡片 / 芯片），
-        // 其次才退到顶部圆形入口。页头收起时那一行的可见高度是 0，不能拿它当落点。
-        val anchor=currentFocus?.takeIf { it.isAttachedToWindow } ?: navEntry() ?: nav.firstOrNull()
-        tvTools.confirm("退出红果TV","收藏与观看进度已经保存在本机，确定要退出吗？",anchor) { finish() }
+        val now=android.os.SystemClock.elapsedRealtime()
+        if(exitArmedAt!=0L && now-exitArmedAt<=EXIT_CONFIRM_WINDOW_MS) {
+            exitArmedAt=0L
+            finish()
+            return
+        }
+        exitArmedAt=now
+        tvTools.toast(EXIT_TOAST)
     }
     @Deprecated("TV remote back is handled through the activity")
     override fun onBackPressed()=goBack()
@@ -772,24 +787,22 @@ class MainActivity: Activity() {
                 }
                 return true
             }
-            // 菜单打开时方向键一律交给焦点系统：PlaybackMenu.wire() 已把四向锁在菜单内部，
-            // 停在最后一行（定时）再按下键，焦点按 nextFocusDownId 落在自己身上、原地不动。
-            // 这里**不能**再接管下键去弹选集：菜单是「上键」打开的浮层，用户在里面按到边缘
-            // 只应该表示「到头了」，而不是顺带换一个界面；选集仍然只由菜单关闭后的下键、
-            // 底部居中的下拉箭头，以及返回键回到简介页进入。
-            if(!panel) {
-                if(key in listOf(KeyEvent.KEYCODE_DPAD_LEFT,KeyEvent.KEYCODE_DPAD_RIGHT,KeyEvent.KEYCODE_DPAD_CENTER,KeyEvent.KEYCODE_ENTER,KeyEvent.KEYCODE_DPAD_UP,KeyEvent.KEYCODE_DPAD_DOWN,KeyEvent.KEYCODE_MENU)) {
-                    if(event.action==KeyEvent.ACTION_DOWN) when(key) {
-                        KeyEvent.KEYCODE_DPAD_LEFT -> seek(-1,event.repeatCount)
-                        KeyEvent.KEYCODE_DPAD_RIGHT -> seek(1,event.repeatCount)
-                        KeyEvent.KEYCODE_DPAD_CENTER,KeyEvent.KEYCODE_ENTER -> if(event.repeatCount==0) togglePlayback()
-                        KeyEvent.KEYCODE_DPAD_DOWN -> if(event.repeatCount==0) showEpisodePanel(hud)
-                        KeyEvent.KEYCODE_DPAD_UP,KeyEvent.KEYCODE_MENU -> if(event.repeatCount==0) showPlaybackMenu()
-                        else -> showHud()
-                    }
-                    return true
-                }
-            }
+            // 播放设置菜单打开时（[panel]）：方向键一律交给焦点系统，PlaybackMenu.wire() 已把四向
+            // 锁在菜单内部，停在最后一行（定时）再按下键，焦点按 nextFocusDownId 落在自己身上、
+            // 原地不动。这里**不能**再接管下键去弹选集：菜单是「上键」打开的浮层，用户在里面按到
+            // 边缘只应该表示「到头了」，而不是顺带换一个界面（选集仍然可以由菜单关闭后的下键、
+            // 底部居中的下拉箭头，以及返回键回到简介页进入——下键绑成什么由按键设置决定）。
+            //
+            // 六个方向键 / 菜单键 / 确定键在播放界面里**不做焦点移动**，一律按当前绑定去执行动作
+            //（绑定与出厂值见 [com.hgtv.star.core.KeyMap]：上 / 菜单 = 播放设置、下 = 选集、
+            // 左 = 快退、右 = 快进、确定 = 播放 / 暂停）。这一条以前是写死的 `when(key)`，
+            // 现在按键设置页可以改，改完立刻生效、并随本机偏好与备份一起走。
+            //
+            // 播放界面上本来就没有可聚焦的按钮（控制条的图标与状态项都不抢焦点），
+            // 因此这里不去「把键放给焦点系统」，直接把这一下消化掉：
+            // 绑成「无」的键也只是什么都不做，不会让焦点跑到别处去。
+            // 返回键在上面已经单独处理，任何绑定下都退得出播放界面。
+            if(!panel) playerKeyAction(key)?.let { return dispatchPlayerKey(it,event) }
         }
         return super.dispatchKeyEvent(event)
     }

@@ -11,8 +11,8 @@ android {
         applicationId = "com.hgtv.star"
         minSdk = 26
         targetSdk = 36
-        versionCode = System.getenv("HGTV_VERSION_CODE")?.toInt() ?: 32
-        versionName = System.getenv("HGTV_VERSION_NAME") ?: "1.0.8"
+        versionCode = System.getenv("HGTV_VERSION_CODE")?.toInt() ?: 33
+        versionName = System.getenv("HGTV_VERSION_NAME") ?: "1.0.9"
     }
     buildFeatures { buildConfig = true }
     signingConfigs {

@@ -107,7 +107,9 @@ object LibraryDisk {
             DanmakuMode.fromStored(values["danmakuMode"] as? String),
             DanmakuStyle.scale((values["danmakuScale"] as? Number)?.toFloat() ?: 1f),
             DanmakuStyle.alpha((values["danmakuAlpha"] as? Number)?.toFloat() ?: 1f),
-            DanmakuSpeed.fromStored(values["danmakuSpeed"] as? String))
+            DanmakuSpeed.fromStored(values["danmakuSpeed"] as? String),
+            // 按键绑定：磁盘上就是 [KeyMap.encode] 的产物（空串 = 全默认），坏值由 decode 逐条丢弃。
+            KeyMap.decode(values["keymap"] as? String).encode())
         return LibraryIndex(BackupData(series("favorites"), history, ids("watched"),
             SearchHistory.decode(values["searches"] as? String ?: "[]"), settings, series("later"), ids("hidden")), updates)
     }

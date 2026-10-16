@@ -65,26 +65,32 @@ internal fun MainActivity.settings(parent: LinearLayout) {
         return view
     }
     /**
-     * 把「弹幕显示」的子项（弹幕速度 / 弹幕大小 / 弹幕透明度）右移一档：
-     * 这三项只对弹幕生效，缩进之后一眼能看出它们归属上面那一行。
+     * 网格里的一格（按钮）：与 [setting] 同一个按钮，宽度交给权重（一行两格）。
+     * 行距与格距由外面的行容器给，这里不加 topMargin。
      */
-    fun indentSetting(view: View) {
-        val params=view.layoutParams as? LinearLayout.LayoutParams ?: return
-        params.leftMargin=dp(TvStyle.GAP_BLOCK)
-        view.layoutParams=params
+    fun gridSetting(row: LinearLayout,label: String,action: ()->Unit): TvButton {
+        val view=TvButton(this,label,ButtonSize.NORMAL,ButtonTone.SECONDARY,alignStart=true,action=action)
+        row.addView(view,lp(0,-2).apply { weight=1f; if(row.childCount>1) leftMargin=dp(TvStyle.GAP_INLINE) })
+        return view
     }
     /**
-     * 滑动条设置项：左侧项目名与上面几行同宽，右侧是可滑的控件。
+     * 整栏宽的一行（左标签 + 右滑轨），返回（滑块，这一整行）。
      *
-     * 返回（滑块，整行容器）：调用方要能按需把**整行**收起来（弹幕隐藏时），
-     * 只藏滑块会在左边留一条空标签。
+     * 高度与上面那排按钮同一档（[TvStyle.BUTTON_NORMAL] + 两条柔光带 = 60dp），
+     * 因此这一栏的三行看起来是同一块料，而不是「按钮 + 两条另一样的东西」。
      *
-     * 与播放设置面板里那两条共用同一个 [DanmakuSlider]，改的是同一份本机偏好，
+     * 左侧留白按按钮的文字内边距给（[TvStyle.BUTTON_PAD_NORMAL] + 柔光带 = 34dp）：
+     * `TvButton` 的文字正是从这里起排的，所以上下三行的文字左边缘会落在同一条竖线上；
+     * 右侧同样留出这段距离，滑轨的百分比读数才不会顶到面板边缘。
+     *
+     * 与播放设置面板里那两条共用同一个 [DanmakuSlider]、改的是同一份本机偏好，
      * 因此设置页调好之后进播放界面立刻就是新的字号 / 透明度。
      */
-    fun sliderSetting(group: LinearLayout,label: String,min: Float,max: Float,step: Float,value: Float,onValue: (Float)->Unit): Pair<DanmakuSlider,View> {
-        val line=row().apply { clipChildren=false; clipToPadding=false }
-        // 标签字号与上面那些整行设置项一致（[TvStyle.BUTTON_TEXT_NORMAL]），不再单独放大一档。
+    fun fullSlider(group: LinearLayout,label: String,min: Float,max: Float,step: Float,value: Float,onValue: (Float)->Unit): Pair<DanmakuSlider,View> {
+        val line=row().apply {
+            clipChildren=false; clipToPadding=false; gravity=Gravity.CENTER_VERTICAL
+            setPadding(dp(TvStyle.BUTTON_PAD_NORMAL)+dp(TvStyle.SOFT_BAND),0,dp(TvStyle.BUTTON_PAD_NORMAL)+dp(TvStyle.SOFT_BAND),0)
+        }
         line.addView(
             text(label,TvStyle.BUTTON_TEXT_NORMAL,TvStyle.text).apply {
                 gravity=Gravity.CENTER_VERTICAL; maxLines=1; ellipsize=TextUtils.TruncateAt.END
@@ -92,13 +98,13 @@ internal fun MainActivity.settings(parent: LinearLayout) {
             lp(dp(110),-2)
         )
         val slider=DanmakuSlider(this,label,min,max,step,value,onValue)
-        line.addView(slider,lp(0,-2).apply { weight=1f })
-        group.addView(line,lp(-1,-2).apply { if(group.childCount>1) topMargin=dp(TvStyle.GAP_INLINE) })
+        line.addView(slider,lp(0,-1).apply { weight=1f })
+        group.addView(line,lp(-1,dp(TvStyle.BUTTON_NORMAL+2*TvStyle.SOFT_BAND)).apply { topMargin=dp(TvStyle.GAP_INLINE) })
         return slider to line
     }
     heading(playback,"播放偏好","所有剧集共用，播放中也可调整")
     heading(device,"片单与设备","保管记录，保持应用更新")
-    // 这些设置项都是全站统一的常规按钮，声明成 TvButton 才能参与下面三列网格的焦点串联。
+    // 这些设置项都是全站统一的常规按钮，声明成 TvButton 才能参与下面几栏的焦点串联。
     lateinit var qualityButton: TvButton
     qualityButton=setting(playback,"默认清晰度  ·  ${library.maxQuality}P") { showQualityPicker(qualityButton,false) }
     lateinit var defaultSpeed: TvButton
@@ -110,79 +116,6 @@ internal fun MainActivity.settings(parent: LinearLayout) {
         library.autoNext=!library.autoNext
         autoNextButton.text="自动连播  ·  ${if(library.autoNext) "开启" else "关闭"}"
     }
-    // 弹幕显示方式，以及它下面的三项（移动速度 / 字号缩放 / 不透明度）。
-    // 顺序是「自动连播 → 弹幕显示 → 弹幕速度 → 弹幕大小 → 弹幕透明度」：后三项都是弹幕显示
-    // 这一项的子项，因此紧跟在它下面、并按 [indentSetting] 缩进一档，和上面的平级设置项区分开。
-    lateinit var danmakuSetting: TvButton
-    // 回调里要用的 syncDanmakuStyleRows 在下面才定义（它要引用三行子项），
-    // 因此这里先建好这一行，等子项齐了再补上回调。
-    danmakuSetting=setting(playback,danmakuLabel("弹幕显示  ·  ")) {}
-    // 弹幕移动速度：三档（慢速 / 标准 / 快速）。它与下面两条外观项一样是「弹幕显示」的子项
-    //（隐藏档下一起收起），因此也按 [indentSetting] 缩进一档，排在字号前面。
-    lateinit var danmakuSpeedSetting: TvButton
-    danmakuSpeedSetting=setting(playback,"弹幕速度  ·  ${library.danmakuSpeed.label}") {
-        showDanmakuSpeedPicker(danmakuSpeedSetting,false)
-    }
-    indentSetting(danmakuSpeedSetting)
-    // 两条滑块连行一起收起来：`DanmakuSlider` 自己只占右半边，行还在的话左边会留一条空标签。
-    // 用 GONE 而不是 INVISIBLE——收起来之后这些行不该再占位置，焦点链也一并跳过它们。
-    lateinit var danmakuScaleLine: View
-    lateinit var danmakuScaleRow: DanmakuSlider
-    val scaleLine=sliderSetting(playback,"弹幕大小",DanmakuStyle.SCALE_MIN,DanmakuStyle.SCALE_MAX,DanmakuStyle.SCALE_STEP,library.danmakuScale) { value ->
-        library.danmakuScale=value; danmakuView?.textScale=value
-    }
-    danmakuScaleRow=scaleLine.first
-    danmakuScaleLine=scaleLine.second
-    lateinit var danmakuAlphaLine: View
-    lateinit var danmakuAlphaRow: DanmakuSlider
-    val alphaLine=sliderSetting(playback,"弹幕透明度",DanmakuStyle.ALPHA_MIN,DanmakuStyle.ALPHA_MAX,DanmakuStyle.ALPHA_STEP,library.danmakuAlpha) { value ->
-        library.danmakuAlpha=value; danmakuView?.textAlpha=value
-    }
-    danmakuAlphaRow=alphaLine.first
-    danmakuAlphaLine=alphaLine.second
-    indentSetting(danmakuScaleLine); indentSetting(danmakuAlphaLine)
-    /**
-     * 隐藏弹幕时收起这三项（速度 / 字号 / 透明度），选回可见档时再放出来。
-     *
-     * 判定只有一份（[DanmakuMode.showsStyle]），设置页与播放设置面板共用同一条规则。
-     *
-     * 这里要同时做三件事，缺一件都会出问题：
-     * 1. 三行连行一起 `GONE`（只藏滑块会在左边留一条空标签，速度那一行整行也不该再占位）；
-     * 2. 把「弹幕显示 → 弹幕速度 → 弹幕大小 → 弹幕透明度」这条上下路径按当前档位重新指一遍——
-     *    隐藏时「弹幕显示」的下键直接去主题网格，可见时再指回那三项，
-     *    否则切回可见档之后这几行收不到上下键（链是单向写死的，不会自己长回来）；
-     * 3. 主题网格首行的上行出口跟着变：隐藏时回「弹幕显示」，可见时回「弹幕透明度」。
-     * 焦点若正停在被收起的那一行上，退回「弹幕显示」。
-     */
-    fun syncDanmakuStyleRows() {
-        val shown=library.danmakuMode.showsStyle
-        listOf<View>(danmakuSpeedSetting,danmakuScaleLine,danmakuAlphaLine).forEach { line ->
-            line.visibility=if(shown) View.VISIBLE else View.GONE
-        }
-        val themeHead=themeRows[TvTheme.entries.first()] ?: danmakuAlphaRow
-        if(shown) {
-            danmakuSetting.nextFocusDownId=danmakuSpeedSetting.id
-            danmakuSpeedSetting.nextFocusUpId=danmakuSetting.id
-            danmakuSpeedSetting.nextFocusDownId=danmakuScaleRow.id
-            danmakuScaleRow.nextFocusUpId=danmakuSpeedSetting.id
-            danmakuScaleRow.nextFocusDownId=danmakuAlphaRow.id
-            danmakuAlphaRow.nextFocusUpId=danmakuScaleRow.id
-            danmakuAlphaRow.nextFocusDownId=themeHead.id
-        } else {
-            danmakuSetting.nextFocusDownId=themeHead.id
-            danmakuSpeedSetting.nextFocusUpId=danmakuSetting.id
-            danmakuSpeedSetting.nextFocusDownId=danmakuSetting.id
-            danmakuScaleRow.nextFocusUpId=danmakuSetting.id
-            danmakuScaleRow.nextFocusDownId=danmakuSetting.id
-            danmakuAlphaRow.nextFocusUpId=danmakuSetting.id
-            danmakuAlphaRow.nextFocusDownId=danmakuSetting.id
-        }
-        // 主题网格首行左半边（前 THEME_GRID_COLUMNS/2 列）的上行出口。
-        val upTo=if(shown) danmakuAlphaRow.id else danmakuSetting.id
-        TvTheme.entries.take(THEME_GRID_COLUMNS/2).mapNotNull { themeRows[it] }.forEach { it.nextFocusUpId=upTo }
-        if(!shown && (danmakuSpeedSetting.hasFocus() || danmakuScaleLine.hasFocus() || danmakuAlphaRow.hasFocus())) danmakuSetting.requestFocus()
-    }
-    danmakuSetting.setOnClickListener { showDanmakuPicker(danmakuSetting,false) { syncDanmakuStyleRows() } }
     lateinit var backup: TvButton
     backup=setting(device,"手机备份与恢复") {
         runCatching { LibraryBackup.encode(library.snapshot()) }.onSuccess { encoded ->
@@ -198,16 +131,6 @@ internal fun MainActivity.settings(parent: LinearLayout) {
     hidden=setting(device,"恢复隐藏的剧集  ·  ${library.hidden().size} 部") {
         library.unhideAll(); hidden.text="恢复隐藏的剧集  ·  0 部"
     }
-    // 可选：填上 App 抓到的口令后，搜索直接使用 App 搜索接口；留空时退回官网搜索。
-    lateinit var session: TvButton
-    fun sessionLabel()="搜索登录态  ·  ${if(library.searchToken.isBlank()) "未设置" else "已设置"}"
-    session=setting(device,sessionLabel()) {
-        tvTools.searchSession(session,library.searchToken,{ token ->
-            library.searchToken=token; applySessionToken(); session.text=sessionLabel()
-        },{
-            library.searchToken=""; applySessionToken(); session.text=sessionLabel()
-        })
-    }
     // 「版本与更新」：打开更新弹窗，可以手动检查、下载并交给系统安装。
     // 有新版本时进入应用会主动提示一次；选过「暂不更新」后不再主动提示，
     // 直到装上任何新版本（见 AppUpdater.declined）。
@@ -219,6 +142,165 @@ internal fun MainActivity.settings(parent: LinearLayout) {
     license=setting(device,"开源许可") {
         tvTools.info("开源许可",licenseText(),license)
     }
+    // —— 弹幕：单独一栏，栏内三行 ——
+    // 上面两列原来分别是 8 项与 5 项（还夹着一个「搜索登录态」），高度差一大截；弹幕这四项
+    // 只对弹幕生效，抽出来单独成栏之后：左列 4 项、右列 4 项，两列高度相当，弹幕也有了自己的标题。
+    //
+    // 栏内按「两个离散项并排、两个连续量各占整行」分三行：第一行是 [弹幕显示 | 弹幕速度]
+    // ——这两个都是「从几档里选一档」，并排一行才能一眼比较；下面两条滑块（弹幕大小 / 弹幕透明度）
+    // 各占一整行——连续量要把滑轨铺满整栏宽度，左端标签、右端百分比读数才排在同一列上，
+    // 半屏宽里塞一条滑轨会挤到只剩两百来 dp，看着糙也不好看数。
+    val danmaku=column().apply { clipChildren=false; clipToPadding=false }
+    groupPanel(danmaku)
+    parent.addView(danmaku,lp(-1,-2).apply { topMargin=dp(TvStyle.GAP_GROUP) })
+    heading(danmaku,"弹幕","显示方式 / 速度 / 字号 / 透明度，正在看剧时也能改")
+    val danmakuTop=row().apply { clipChildren=false; clipToPadding=false }
+    danmaku.addView(danmakuTop,lp(-1,-2))
+    // 弹幕显示方式：第一行左格。回调里要用的 syncDanmakuStyleRows 在下面才定义
+    //（它要引用另外三项），因此这里先用空动作建好这一格，等四项齐了再补上回调。
+    lateinit var danmakuSetting: TvButton
+    danmakuSetting=gridSetting(danmakuTop,danmakuLabel("弹幕显示  ·  ")) {}
+    // 弹幕移动速度：第一行右格，三档（慢速 / 标准 / 快速）。
+    lateinit var danmakuSpeedSetting: TvButton
+    danmakuSpeedSetting=gridSetting(danmakuTop,"弹幕速度  ·  ${library.danmakuSpeed.label}") {
+        showDanmakuSpeedPicker(danmakuSpeedSetting,false)
+    }
+    // 弹幕大小：整行一条滑块。
+    val scaleCell=fullSlider(danmaku,"弹幕大小",DanmakuStyle.SCALE_MIN,DanmakuStyle.SCALE_MAX,DanmakuStyle.SCALE_STEP,library.danmakuScale) { value ->
+        library.danmakuScale=value; danmakuView?.textScale=value
+    }
+    lateinit var danmakuScaleLine: View
+    lateinit var danmakuScaleRow: DanmakuSlider
+    danmakuScaleRow=scaleCell.first
+    danmakuScaleLine=scaleCell.second
+    // 弹幕透明度：整行一条滑块。
+    val alphaCell=fullSlider(danmaku,"弹幕透明度",DanmakuStyle.ALPHA_MIN,DanmakuStyle.ALPHA_MAX,DanmakuStyle.ALPHA_STEP,library.danmakuAlpha) { value ->
+        library.danmakuAlpha=value; danmakuView?.textAlpha=value
+    }
+    lateinit var danmakuAlphaLine: View
+    lateinit var danmakuAlphaRow: DanmakuSlider
+    danmakuAlphaRow=alphaCell.first
+    danmakuAlphaLine=alphaCell.second
+    // 「按键设置」那一栏的六格与「恢复默认」那一行。链的顺序是 弹幕栏 → 按键栏 → 主题网格，
+    // 这里先留好引用，等下面建好那一栏再接线（见 [syncDanmakuStyleRows] 与按键栏那一段）。
+    var keyCells: List<TvButton> = emptyList()
+    var keyRestore: TvButton? = null
+    /**
+     * 隐藏弹幕时收起三行（速度那一格 + 字号 / 透明度两条滑块），选回可见档时再放出来。
+     *
+     * 判定只有一份（[DanmakuMode.showsStyle]），设置页与播放设置面板共用同一条规则。
+     *
+     * 这里要同时做四件事，缺一件都会出问题：
+     * 1. 收起的单位是**行**：第一行右格（速度）与下面两条滑块整行一起 `GONE`——只藏控件
+     *    会在左边留一截空标签、整行还占着那一档行距；第一行只剩「弹幕显示」一格后
+     *    它按权重撑满整行，看起来就是一条常规设置项；
+     * 2. 竖排路径（显示 → 大小 → 透明度 → 主题网格，反向逐级回去）按当前档位重指一遍
+     *    ——链是单向写死的，切回可见档之后不会自己长回来；
+     * 3. 第一行的横排出口（显示 ↔ 速度）与两条滑块自己的左右出口跟着变：滑块各占整行，
+     *    左右键只在值真的变了时被它吃掉（见 [DanmakuSlider]），所以让左右出口指回自己，
+     *    按到值两端时不会跳走；隐藏档下第一行只有一格，左右都指回自己；
+     * 4. 主题网格首行的上行出口跟着变：可见时整行都回到它正上方那条「弹幕透明度」，
+     *    隐藏时回到「弹幕显示」；焦点若正停在被收起的那几行上，也一并退回「弹幕显示」。
+     */
+    fun syncDanmakuStyleRows() {
+        val shown=library.danmakuMode.showsStyle
+        danmakuSpeedSetting.visibility=if(shown) View.VISIBLE else View.GONE
+        danmakuScaleLine.visibility=if(shown) View.VISIBLE else View.GONE
+        danmakuAlphaLine.visibility=if(shown) View.VISIBLE else View.GONE
+        danmakuScaleRow.isFocusable=shown
+        danmakuAlphaRow.isFocusable=shown
+        val themeHead=themeRows[TvTheme.entries.first()] ?: danmakuAlphaRow
+        // 弹幕栏下面就是「按键设置」那一栏（再下面才是主题网格）：两处的出口都按当前档位现算，
+        // 那一栏还没建好时（理论上不会）落回主题网格，焦点链不会断。
+        val keyHead=keyCells.firstOrNull()?.id ?: themeHead.id
+        val keyTail=keyRestore?.id ?: themeHead.id
+        // 竖排：显示 ↓ 大小 ↓ 透明度 ↓ 按键栏 ↓ 主题网格；反向 主题网格 ↑ 按键栏 ↑ 透明度 ↑ 速度 ↑ 显示。
+        // 隐藏档下这三行都不占位，上下都直接落回「弹幕显示」或下一栏。
+        danmakuSetting.nextFocusDownId=if(shown) danmakuScaleRow.id else keyHead
+        danmakuSpeedSetting.nextFocusDownId=if(shown) danmakuScaleRow.id else danmakuSetting.id
+        danmakuScaleRow.nextFocusUpId=danmakuSetting.id
+        danmakuScaleRow.nextFocusDownId=if(shown) danmakuAlphaRow.id else danmakuSetting.id
+        danmakuAlphaRow.nextFocusUpId=if(shown) danmakuSpeedSetting.id else danmakuSetting.id
+        danmakuAlphaRow.nextFocusDownId=if(shown) keyHead else danmakuSetting.id
+        // 按键栏第一行往上回到弹幕栏的最后一行（可见档 → 弹幕透明度、隐藏档 → 弹幕显示），
+        // 最后一行的下行出口接主题网格第一行：整条竖链只有这一份出口，按档位现指。
+        keyCells.firstOrNull()?.nextFocusUpId=if(shown) danmakuAlphaRow.id else danmakuSetting.id
+        keyRestore?.nextFocusDownId=themeHead.id
+        // 横排：第一行两格互指；两条滑块各占整行，左右出口指回自己（值到两端时就停住）。
+        danmakuSetting.nextFocusLeftId=danmakuSetting.id
+        danmakuSetting.nextFocusRightId=if(shown) danmakuSpeedSetting.id else danmakuSetting.id
+        danmakuSpeedSetting.nextFocusLeftId=danmakuSetting.id
+        danmakuSpeedSetting.nextFocusRightId=danmakuSetting.id
+        danmakuScaleRow.nextFocusLeftId=danmakuScaleRow.id
+        danmakuScaleRow.nextFocusRightId=danmakuScaleRow.id
+        danmakuAlphaRow.nextFocusLeftId=danmakuAlphaRow.id
+        danmakuAlphaRow.nextFocusRightId=danmakuAlphaRow.id
+        // 主题网格首行：正上方就是这一栏的最后一行（弹幕透明度；隐藏档下是弹幕显示）。
+        // 主题网格第一行的正上方是「按键设置」那一栏的最后一行（那一栏还没建好时退回弹幕栏）。
+        TvTheme.entries.chunked(THEME_GRID_COLUMNS).firstOrNull().orEmpty().forEach { option ->
+            themeRows[option]?.nextFocusUpId=keyTail
+        }
+        if(!shown && (danmakuSpeedSetting.hasFocus() || danmakuScaleRow.hasFocus() || danmakuAlphaRow.hasFocus())) danmakuSetting.requestFocus()
+    }
+    danmakuSetting.setOnClickListener { showDanmakuPicker(danmakuSetting,false) { syncDanmakuStyleRows() } }
+    // —— 按键设置：整宽分组 + 2 × 3 的网格 + 「恢复默认按键」 ——
+    // 六格排成两列三行（上 / 下、左 / 右、菜单 / 确定），比一行六个宽得多也短得多：
+    // 每一格都要写出「键名 · 当前动作」，一屏宽塞六个只会全都变成省略号。
+    //
+    // 作用域是**播放界面**：浏览页面里上下左右就是焦点移动，是遥控器的基本手感，不能改；
+    // 返回键也不在其中——它在任何绑定下都必须是退出播放的出口，否则用户可能把自己锁在播放界面里。
+    // 这两条边界写在 [com.hgtv.star.core.KeyMap] 的注释里，改这里之前先读那一段。
+    val keys=column().apply { clipChildren=false; clipToPadding=false }
+    groupPanel(keys)
+    parent.addView(keys,lp(-1,-2).apply { topMargin=dp(TvStyle.GAP_GROUP) })
+    heading(keys,"按键设置","播放界面：上下左右 / 菜单键 / 确定键各做什么，改完立刻生效")
+    val keyLines=listOf(row(),row(),row()).onEachIndexed { index,line ->
+        keys.addView(line,lp(-1,-2).apply { if(index>0) topMargin=dp(TvStyle.GAP_INLINE) })
+    }
+    /**
+     * 六格 + 「恢复默认」那一行的文案：改完一个键就地刷新，不重建整页。
+     *
+     * 只改文字（[TvButton.setLabel]），不动视图树：焦点仍停在用户刚点的那一格上，
+     * 视线不会因为一次重排而跳走（清晰度 / 倍速那几行也是这么做的）。
+     *
+     * 它写在 [keyCell] 前面：Kotlin 的局部函数不能前向引用，而每一格的点击回调要用它。
+     */
+    fun refreshKeyLabels() {
+        keyCells.forEachIndexed { index,cell ->
+            val label=keyRowLabel(PlayerKey.entries[index])
+            cell.setLabel(label); cell.contentDescription=label
+        }
+        keyRestore?.setLabel(restoreKeysLabel())
+    }
+    /**
+     * 一格按键：与上面两列同一个按钮（左对齐、等分一行两格），文案是「键名  ·  当前动作」。
+     *
+     * 点击回调在按钮建好之后才挂：它要引用按钮自己（弹窗关掉时把焦点还给这一格），
+     * 与弹幕那一格是同一套写法（见 [gridSetting] 与上面的 `danmakuSetting.setOnClickListener`）。
+     */
+    fun keyCell(line: LinearLayout,key: PlayerKey): TvButton {
+        val cell=gridSetting(line,"") {}
+        cell.setOnClickListener { showKeyActionPicker(key,cell) { refreshKeyLabels() } }
+        return cell
+    }
+    keyCells=PlayerKey.entries.mapIndexed { index,key -> keyCell(keyLines[index/KEY_GRID_COLUMNS],key) }
+    keyCells.forEachIndexed { index,cell ->
+        // 行内左右互指、行间上下互指，两端停在自己身上（与主题网格同一套规则）。
+        cell.nextFocusLeftId=(keyCells.getOrNull(index-1)?.takeIf { index%KEY_GRID_COLUMNS!=0 } ?: cell).id
+        cell.nextFocusRightId=(keyCells.getOrNull(index+1)?.takeIf { index%KEY_GRID_COLUMNS!=KEY_GRID_COLUMNS-1 } ?: cell).id
+        cell.nextFocusUpId=(keyCells.getOrNull(index-KEY_GRID_COLUMNS) ?: cell).id
+        cell.nextFocusDownId=(keyCells.getOrNull(index+KEY_GRID_COLUMNS) ?: cell).id
+    }
+    // 「恢复默认按键」：整栏宽的一行，改回出厂绑定（上 / 菜单 = 播放设置、下 = 选集、
+    // 左 = 快退、右 = 快进、确定 = 播放 / 暂停）。文案本身就是读数，恢复之后它会写回「当前为默认」。
+    val restore=setting(keys,"") { library.keyMap=KeyMap.DEFAULT; refreshKeyLabels() }
+    keyRestore=restore
+    restore.nextFocusLeftId=restore.id
+    restore.nextFocusRightId=restore.id
+    restore.nextFocusUpId=keyCells.lastOrNull()?.id ?: restore.id
+    // 最后一行的两格按下都进「恢复默认」（下面那一行整栏宽，两格落到同一处）。
+    keyCells.takeLast(KEY_GRID_COLUMNS).forEach { it.nextFocusDownId=restore.id }
+    refreshKeyLabels()
     // —— 主题外观：整宽分组 + 一行 THEME_GRID_COLUMNS 个芯片 ——
     // 14 套材质排成 4 行，比「一行一个主题」省下三分之二的高度；
     // 芯片就是全站统一的按钮（紧凑档），选中态是「按进去」的凹槽，凹下去的那一枚就是当前主题。
@@ -248,38 +330,42 @@ internal fun MainActivity.settings(parent: LinearLayout) {
         lp(-1,-2)
     )
     // —— 焦点串联 ——
-    // 上面两列：列内上下、列间左右按行号对齐；行数不足时停在原地，焦点不会跑到框外。
-    // 播放偏好那一列**始终**把两条外观项算进去：它们只是隐藏档下不可见，
-    // 但「弹幕显示 → 弹幕大小 → 弹幕透明度」这条上下路径必须先在链上，
-    // 否则在弹窗里切回可见档之后这两行还是选不中（早先按档位裁剪列内容的写法就栽在这里）。
-    // 隐藏档下由 [syncDanmakuStyleRows] 把「弹幕显示」的下行出口直接指到主题网格。
-    val playbackItems=mutableListOf<View>(qualityButton,defaultSpeed,frame,autoNextButton,
-        danmakuSetting,danmakuSpeedSetting,danmakuScaleRow,danmakuAlphaRow)
-    val columns=listOf(playbackItems,listOf<View>(backup,hidden,session,versionRow,license))
-    columns.forEach { items -> items.forEachIndexed { index,view ->
+    // 上面两列：列内上下、列间左右按行号对齐（现在两列都是 4 项，行号一一对应）；
+    // 末项按下进弹幕那一栏的第一行（左列接「弹幕显示」、右列接「弹幕速度」，与列号对齐）。
+    // 弹幕栏内部的上下左右**全部**由 [syncDanmakuStyleRows] 按当前档位指：那三行只是隐藏档下
+    // 不占位，链必须先在再按档位改，否则在弹窗里切回可见档之后这几行还是选不中
+    //（早先按档位裁剪列内容的写法就栽在这里）。
+    val playbackItems=listOf<View>(qualityButton,defaultSpeed,frame,autoNextButton)
+    val deviceItems=listOf<View>(backup,hidden,versionRow,license)
+    val columns=listOf(playbackItems,deviceItems)
+    columns.forEachIndexed { column,items -> items.forEachIndexed { index,view ->
         view.nextFocusUpId=items.getOrNull(index-1)?.id ?: (navEntry()?.id ?: View.NO_ID)
-        view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
+        // 两列的末项（自动连播 / 开源许可）按下进弹幕那一栏的第一行，各接自己那一半。
+        view.nextFocusDownId=items.getOrNull(index+1)?.id ?: (if(column==0) danmakuSetting.id else danmakuSpeedSetting.id)
     } }
+    // 弹幕那一栏：第一行左格上行回到「自动连播」、右格上行回到「开源许可」（与上面两列的末项对接），
+    // 栏内其余的上下左右出口由 [syncDanmakuStyleRows] 按当前档位指（隐藏时那三行不占位）。
+    danmakuSetting.nextFocusUpId=autoNextButton.id
+    danmakuSpeedSetting.nextFocusUpId=license.id
     columns.forEachIndexed { column,items -> items.forEachIndexed { index,view ->
         view.nextFocusLeftId=(columns.getOrNull(column-1)?.getOrNull(index) ?: view).id
         view.nextFocusRightId=(columns.getOrNull(column+1)?.getOrNull(index) ?: view).id
     } }
-    // 主题网格：行内左右相连、行间上下相连，两端停住；第一行往上回到上面两列的最后一行
-    // （左半边回到「播放偏好」的末项，右半边回到「片单与设备」的末项）。
+    // 主题网格：行内左右相连、行间上下相连，两端停住；第一行往上回到它正上方那一行，
+    // 也就是弹幕那一栏的最后一行（可见档 → 「弹幕透明度」、隐藏档 → 「弹幕显示」，
+    // 出口按档位现算，见 [syncDanmakuStyleRows]）。
     val themeLines=TvTheme.entries.mapNotNull { themeRows[it] }.chunked(THEME_GRID_COLUMNS)
     themeLines.forEachIndexed { rowIndex, line ->
         line.forEachIndexed { index, chip ->
             chip.nextFocusLeftId=line.getOrNull(index-1)?.id ?: chip.id
             chip.nextFocusRightId=line.getOrNull(index+1)?.id ?: chip.id
             // 第一行的上行出口交给 [syncDanmakuStyleRows] 按当前弹幕档位指过去
-            // （左半边到「弹幕显示」或「弹幕透明度」，右半边到「开源许可」）。
-            chip.nextFocusUpId=themeLines.getOrNull(rowIndex-1)?.getOrNull(index)?.id
-                ?: if(index<THEME_GRID_COLUMNS/2) danmakuSetting.id else license.id
+            // （整行都在弹幕那一栏下面，因此整行都回到它的最后一行）。
+            chip.nextFocusUpId=themeLines.getOrNull(rowIndex-1)?.getOrNull(index)?.id ?: (keyRestore?.id ?: danmakuAlphaRow.id)
             chip.nextFocusDownId=themeLines.getOrNull(rowIndex+1)?.getOrNull(index)?.id ?: chip.id
         }
     }
-    // 左半边的下行出口由 syncDanmakuStyleRows 按当前弹幕档位指过去；右半边固定回「开源许可」。
-    license.nextFocusDownId=(themeRows[TvTheme.entries[THEME_GRID_COLUMNS/2]] ?: license).id
+    // 两列的末项按下都进弹幕栏（见上面的 columns 循环），这里不再单独指右半边。
     syncDanmakuStyleRows()
     navIcons().forEach { it.nextFocusDownId=qualityButton.id }
     parent.addView(text("红果TV  /  ${BuildConfig.VERSION_NAME}    ·    收藏与进度保存在本机",12f,muted).apply { setPadding(dp(12),dp(20),0,dp(10)) })
