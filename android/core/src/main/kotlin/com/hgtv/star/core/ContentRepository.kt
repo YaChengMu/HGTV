@@ -20,10 +20,10 @@ data class Series(val id: String, val title: String, val cover: String = "", val
 data class Detail(val series: Series, val episodes: List<String>)
 
 /**
- * 简介页下方那一栏的内容：同系列各季在前（按季号升序），官网的相关短剧在后，已去重。
+ * 简介页下方那一栏的内容：同系列各季在前（按季号升序），其余相关作品在后，已去重。
  *
- * **不随详情一起返回**：找同系列要额外发搜索请求，而详情页每次进都要开一次，
- * 把它挂在详情上会让「进简介页」变慢。界面点开「相关剧集」时才调 [ContentRepository.related]。
+ * **不随详情一起返回**：那一栏要额外发一次 App 请求，而详情页每次进都要开一次，
+ * 把它挂在详情上会让「进简介页」变慢。界面在详情上屏之后后台预取（见 `prefetchRelated`）。
  */
 data class RelatedWorks(
     val items: List<Series>,
@@ -49,6 +49,15 @@ data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages:
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
 data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
+/**
+ * 这个请求需要登录态，而本机还没有可用的凭据（或凭据已失效）。
+ *
+ * 账号侧接口（收藏 / 历史 / 点赞 / 预约 / 资料）与带登录态的搜索都要求先导入
+ * `sessionid`（见 [AccountCredentials]）。未导入时它们**一律不可用**：
+ * 平台对匿名设备要么回空响应体、要么把请求降级成匿名账号，两者都会让界面显示
+ * 「一条记录都没有」而不是「你还没导入」——因此统一抛这个异常，由界面翻成提示。
+ */
+class SignInRequiredException(message: String = "需要先导入账号参数（sessionid）"): IOException(message)
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
     private val signer = Signer()
@@ -58,6 +67,43 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      * 8662 就是「红果短剧」在番茄系里的 aid（与 [VendorConstants.device] 里的 `aid` 同值）。
      */
     private val SUGGEST_APP_ID = "8662"
+    /** 账号接口的域名。与搜索 / 弹幕同一套（[appValues] 的设备参数对这几个域名都认）。 */
+    private val ACCOUNT_HOST = "api5-normal-sinfonlinea.fqnovel.com"
+    /** 账号接口空响应体的重试次数。 */
+    private val ACCOUNT_RETRIES = 4
+    /** 写接口里「短剧」的 `book_type`（App 的 `ReadingBookType.Watch`）。 */
+    private val BOOK_TYPE_WATCH = 2
+    /** 写接口里「加入追剧」的操作码（App 的 `VideoShelfOperateType.AddShelf`）。 */
+    private val VIDEO_SHELF_ADD_SHELF = 0
+    /** 写接口里「取消追剧」的操作码（App 的 `VideoShelfOperateType.DelShelf`）。 */
+    private val VIDEO_SHELF_DEL_SHELF = 1
+    /**
+     * 写接口的诊断日志出口。
+     *
+     * `core` 是纯 Kotlin 模块（没有 Android SDK），所以不能直接 `Log.i`；
+     * 界面层启动时把它接到 `android.util.Log`（见 `MainActivity`），不接就是空操作。
+     */
+    var writeLog: (String) -> Unit = {}
+    /**
+     * 写接口被风控（`101144 HIT_SHARK_RULE`）时的重试次数与退避间隔（毫秒）。
+     *
+     * 风控窗口通常是**秒级到十几秒**：实测同一条请求隔 1s 重发还是被挡、隔十几秒就能过，
+     * 因此退避必须拉开（早期写的 400/1000/1600ms 全落在同一个窗口里，等于没重试）。
+     */
+    private val ACCOUNT_WRITE_ATTEMPTS = 4
+    private val ACCOUNT_WRITE_BACKOFF = longArrayOf(1_200L,4_000L,12_000L)
+    /**
+     * 一次 `multi-detail` 最多带多少个 id。
+     *
+     * 实测 50 个 id 一次能全部回（0.6s），因此按历史条数上限取 50：
+     * 取小了（曾经是 20）会让第 21 条起只剩 `series_id`、没有片名与封面，
+     * 界面上就是一排**空框**——这正是「历史里很多框不显示内容」的原因。
+     */
+    private val MULTI_DETAIL_LIMIT = 50
+    /** 账号那七个请求共用的线程池：它们彼此独立，串行发要两三秒。 */
+    private val accountPool=java.util.concurrent.Executors.newFixedThreadPool(6) { task ->
+        Thread(task,"hgtv-account").apply { isDaemon=true }
+    }
     /**
      * 提示词接口的 `web_id`：官网上是每次页面加载生成的一个随机标识。
      * 这里整个进程生成一次即可（服务端并不校验它与会话的对应关系）。
@@ -115,32 +161,131 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      */
     @Volatile var sessionToken: String?=null
     /**
+     * 账号凭据（个人信息页导入的整套登录态）。
+     *
+     * 与 [sessionToken] 的分工：`sessionToken` 是历史遗留的「只给搜索用的口令」，
+     * 这里这份带设备档案，账号接口（收藏 / 历史 / 点赞 / 预约 / 资料）与 App 搜索都用它。
+     * 两处都配了时以这份为准（见 [withSession]）。
+     */
+    @Volatile var credentials: AccountCredentials?=null
+        set(value) {
+            // 登录态一换，「App 搜索还能不能用」这个判断就得重新做：
+            // 匿名时接口回空 body（被判死），配上凭据之后它是能出数据的。
+            if(field?.cookie!=value?.cookie) appSearchAlive=null
+            field=value
+            // 签名里的 x-medusa 要上报设备档案（机型 / 系统版本 / cdid …），
+            // 与凭据一起换掉，免得拿着 A 设备的档案去发 B 设备的写请求。
+            // 档案是三层合并的结果（见 [deviceProfile]）：内置 → 本机身份 → 凭据的真机档案。
+            signer.updateDevice(deviceProfile())
+        }
+    /**
+     * 本机设备身份（`device_id` / `iid`），由界面层注入（见 `Library.deviceIdentity`）。
+     *
+     * **这份身份必须是平台注册过的**（[registerDevice] 的下发结果）：内容接口按
+     * 「服务端注册过的 `device_id` + `install_id` 这一对」放行，随便编一对数字
+     * （哪怕形状完全正确）都拿不到数据——App 搜索回 `200 + 0 字节`、播放回
+     * `101000 服务异常`。注册是匿名的，见 [DeviceRegister]。
+     *
+     * 内置档案里那个 `device_id`（`1905892595378490`）另外还被单独拉黑（大量第三方共用），
+     * 所以**不要**回落到它：没注册过时本字段就是空表，调用方要先注册。
+     */
+    @Volatile var deviceIdentity: Map<String,String> = emptyMap()
+        set(value) { field=value.filterValues { it.isNotBlank() }; signer.updateDevice(deviceProfile()) }
+    /**
+     * 共用另一份仓库实例的**设备身份与注册 Cookie**（[deviceIdentity] 与 `registrationCookies`）。
+     *
+     * 播放预取会另开一个 [ContentRepository]（独立连接池与超时），它自己没注册过设备：
+     * 不把这两个值带过去，它签名时只能用内置那份档案（`device_id` 被平台拉黑），
+     * 取播放地址必然空响应——那一集永远预取不命中。
+     */
+    fun inheritDevice(from: ContentRepository) {
+        deviceIdentity=from.deviceIdentity
+        registrationCookies=from.registrationCookies
+    }
+    /**
+     * 注册用的设备档案（机型 / 系统 / `cdid` / `openudid` …），与 [deviceIdentity] 分开存：
+     * 注册要在**还没有** `device_id` 的时候发出去，注册完拿到的那对身份再交给 [deviceIdentity]。
+     * 由界面层从本机设置注入（见 `Library.deviceProfile`）。
+     */
+    @Volatile var registerProfile: Map<String,String> = emptyMap()
+    /**
+     * 匿名注册一台设备，拿到平台认可的 `device_id` / `install_id`。
+     *
+     * 成功后**立刻**写入 [deviceIdentity]（后续请求马上用得上），并把下发的 Cookie 并进
+     * 签名档案。失败（网络 / 服务端拒绝）返回 null，调用方按「没注册」处理即可——
+     * 播放与搜索都会各自走回退路径，不会因为注册失败而整页报错。
+     */
+    fun registerDevice(): DeviceRegister.Registered? {
+        val device=LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
+        val body=DeviceRegister.payload(device)
+        val headers=DeviceRegister.headers(body,device)
+        val registered=runCatching {
+            val request=Request.Builder().url(DeviceRegister.url())
+            headers.forEach { (key,value) -> request.header(key,value) }
+            request.post(body.toRequestBody("application/octet-stream".toMediaType()))
+            RequestScope.execute(http.newCall(request.build())) { response ->
+                if(!response.isSuccessful) throw IOException("设备注册失败（HTTP ${response.code}）")
+                val bytes=response.body?.bytes() ?: throw IOException("设备注册响应为空")
+                DeviceRegister.parse(String(bytes,Charsets.UTF_8),response.headers("Set-Cookie"))
+                    ?: throw IOException("设备注册被服务端拒绝")
+            }
+        }.getOrNull()
+        if(registered!=null) {
+            deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId)
+            registrationCookies=LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
+        }
+        return registered
+    }
+    /** 注册下发的 Cookie（`install_id` / `ttreq` / `store-region`），随注册请求一起带上。 */
+    @Volatile private var registrationCookies: Map<String,String> = emptyMap()
+        set(value) { field=LinkedHashMap(value) }
+    /**
+     * 签名与设备参数共用的**三层合并档案**（后一层压前一层）：
+     *
+     * 1. [VendorConstants.device]：内置档案，兜底用；
+     * 2. [deviceIdentity]：本机身份（`device_id` / `iid`），来自 [registerDevice] 的注册结果；
+     * 3. [credentials] 带来的**真机档案**：`device_type` / `cdid` / `klink_egdi` / `rom_version` …，
+     *    写接口（追剧 / 进度）要与凭据一致，因此它优先级最高。
+     */
+    private fun deviceProfile(): Map<String,String> =
+        LinkedHashMap(VendorConstants.device).apply {
+            putAll(deviceIdentity)
+            credentials?.device?.forEach { (key,value) -> if(value.isNotBlank()) this[key]=value }
+        }
+    /**
      * 弹幕接口是播放器接口，走 App 域名（与搜索 / 详情同一套设备参数）。
      * 站点有多条线路，单条失败时依次换线，最后一条仍失败才放弃本窗口。
      */
     /**
-     * 找同系列各季时最多扫几页片库目录（每页 24 部、共 34 页）。
-     *
-     * 官网搜索对同一关键词返回的 10 条**不稳定**（同一部剧的某一季有时在前 10、有时不在），
-     * 片库目录则是稳定分页的，因此这里是召回的最后一道保险：实测 3 页能捞回第九季，
-     * 6 页能把「聚宝仙盆之杂灵根才是真BOSS」的 13 季凑齐。这几页是并发请求的，代价可控。
+     * 「相关作品」接口的线路，按实测命中率排序（同一条线路约一半概率回空响应体，
+     * 换线重发即可；六条线路轮一圈的成功率接近 1）。
      */
-    private val SEASON_CATALOG_PAGES=6
-    /** 除完整基名外，还依次去掉 1~3 个尾字各搜一次：官网搜索换关键词就是换一批结果。 */
-    private val SEASON_SEARCH_TRIMS=3
-    /** 沿季号逐季搜索的上限（季号），以及「连续几个季号没命中就停」的阈值。 */
-    private val SEASON_SEARCH_LIMIT=40
-    private val SEASON_MISS_LIMIT=3
-    /** 季号搜索的上探余量：搜 1 到「当前季 + 这个数」，用来捞当前季之后新上线的季。 */
-    private val SEASON_LOOKAHEAD=2
-    /** 相关剧集取数用的小线程池：这些请求彼此独立，串行发要一分多钟。 */
-    private val relatedPool=java.util.concurrent.Executors.newFixedThreadPool(4) { task ->
-        Thread(task,"hgtv-related").apply { isDaemon=true }
-    }
-    /** 同系列结果的内存缓存条数：按基名索引，界面重复点开同一部剧时直接命中。 */
-    private val SEASON_CACHE_LIMIT=16
-    private val seasonCache=linkedMapOf<String,List<Series>>()
+    private val relatedHosts=listOf(
+        "api5-normal-hl.fqnovel.com","api5-normal-lf.fqnovel.com","api5-normal-sinfonlinec.fqnovel.com",
+        "api5-normal-sinfonlinea.fqnovel.com","api5-normal-lq.fqnovel.com","api5-normal-sinfonlineb.fqnovel.com"
+    )
+    /** 「相关作品」接口最多试几次（每次换一条线路）：空响应体是常态，不是错误。 */
+    private val RELATED_ATTEMPTS=8
+    /** 「相关作品」那一栏的 cell 标识：`show_type=547` / `cell_name="相关作品"`。 */
+    private val RELATED_CELL_SHOW_TYPE=547
+    private val RELATED_CELL_NAME="相关作品"
+    /**
+     * 相关作品的内存缓存条数：按剧集 ID 索引。
+     *
+     * 界面自己已经做了「同一部剧不重复预取」（`relatedFor`），这里再兜一层是为了
+     * 「看一集 → 回简介 → 再点相关剧集」这条路径：那一栏的内容不会变，
+     * 没必要每进一次详情就再打一次接口。
+     */
+    private val RELATED_CACHE_LIMIT=16
+    private val relatedCache=linkedMapOf<String,RelatedWorks>()
     private val commentHosts=listOf("api5-normal-sinfonlinea.fqnovel.com","api5-normal-sinfonlinec.fqnovel.com","api5-normal-sinfonlineb.fqnovel.com","api5-normal-lf.fqnovel.com","api5-normal-lq.fqnovel.com","api5-normal-hl.fqnovel.com")
+    /**
+     * 播放接口空响应体的原地重发次数。
+     *
+     * 平台 2026-10-15 起对匿名设备一律回 `200 + 0 字节`；带上登录态后基本稳定，
+     * 但仍偶发，因此同一条路径上先重发几次再换下一条——否则会把唯一能用的那条也跳过去。
+     */
+    private val PLAYBACK_RETRIES=3
     private fun text(url: String, signed: Signer.Request? = null): String {
         val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
         signed?.headers?.forEach { (k,v) -> request.header(k,v) }
@@ -155,24 +300,75 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             String(bytes,Charsets.UTF_8)
         }
     }
+    /**
+     * 协议常量：官方 App 里也是硬编码，不随设备变。
+     *
+     * 动态化**只针对设备属性**（机型 / 系统 / device_id / cdid …），
+     * `aid` / `app_name` 这类跟着官方包走就行。
+     */
+    private val PROTOCOL_VALUES = linkedMapOf(
+        "ac" to "wifi","aid" to "8662","app_name" to "novelread","ssmix" to "a",
+        "device_platform" to "android","os" to "android","language" to "zh",
+        "compliance_status" to "0","need_personal_recommend" to "1","player_so_load" to "1",
+        "host_abi" to "arm64-v8a"
+    )
+    /**
+     * 写接口（追剧 / 进度 / 历史）用的设备参数。
+     *
+     * 与 [appValues] 的两点不同，都是照官方抓包对齐的：
+     * * 客户端版本用 `73932` / `7.3.9.32`（写接口走的是这一版，混用会被按旧客户端处理）；
+     * * 叠加导入凭据时带来的**真机档案**（`cdid` / `klink_egdi` / `rom_version` 这些
+     *   内置档案里根本没有，而官方请求每条都带）。
+     */
+    private fun writeValues(): LinkedHashMap<String,String> = deviceValues("73932","7.3.9.32")
     /** 搜索 / 弹幕这类 App 接口共用的设备参数：与播放器版本对齐，避免平台按旧版本拒绝。 */
-    private fun appValues(): LinkedHashMap<String,String> {
-        val values=VendorConstants.device.toMutableMap()
-        for(key in listOf("version_code","manifest_version_code","update_version_code","pv_player")) values[key]="72232"
-        values["version_name"]="7.2.2.32"
-        return LinkedHashMap(values)
+    private fun appValues(): LinkedHashMap<String,String> = deviceValues("72232","7.2.2.32")
+    /**
+     * 设备参数的分层组装（后一层压前一层，合并规则见 [deviceProfile]）：
+     *
+     * 1. [VendorConstants.device]：内置档案，兜底用；
+     * 2. [deviceIdentity]：本机身份（`device_id` / `iid`），来自 [registerDevice] 的注册结果；
+     * 3. 导入凭据带来的**真机档案**：`device_type` / `device_brand` / `os_version` /
+     *    `cdid` / `klink_egdi` / `rom_version` … 这些内置档案里没有或对不上的字段；
+     * 3. [PROTOCOL_VALUES] 与客户端版本：协议常量，官方 App 也硬编码，
+     *    放在最后一层保证 `aid` / `app_name` 不会被档案里的同名值冲掉。
+     */
+    private fun deviceValues(versionCode: String, versionName: String): LinkedHashMap<String,String> {
+        val values=LinkedHashMap(deviceProfile())
+        values.putAll(PROTOCOL_VALUES)
+        for(key in listOf("version_code","manifest_version_code","update_version_code","pv_player")) values[key]=versionCode
+        values["version_name"]=versionName
+        return values
     }
     /**
-     * 给搜索请求补上登录态。平台对匿名设备返回空响应体，只有带上登录口令才有数据；
-     * 直接粘贴整段 Cookie（形如 `sessionid=…`）时同时按 `Cookie` 头发一次。
+     * 给 App 接口补上身份。两件事，分开做：
+     *
+     * 1. **设备 Cookie**：`registerDevice` 下发的 `install_id` / `ttreq` / `store-region`
+     *    每个请求都要带——平台靠它们把请求认到那台已注册设备上（少了这一步，
+     *    即使 `device_id` 已在 query 里，服务端也可能不认）。
+     * 2. **登录态**（可选）：账号凭据的整段 Cookie，或历史遗留的 `sessionToken`。
+     *    两者都没有就只带设备 Cookie——搜索与播放对匿名设备一样放行。
      */
     private fun Signer.Request.withSession(): Signer.Request {
+        // 账号凭据优先：它带的是整套 Cookie（App 接口既要 Cookie 又要与之一致的设备参数）。
+        val cookie=credentials?.cookie?.takeIf { it.isNotBlank() }
+        if(cookie!=null) return copy(headers=headers+linkedMapOf("x-tt-token" to cookie,"Cookie" to cookie))
+        val deviceCookie=registrationCookies.entries.joinToString("; ") { (name,value) -> "$name=$value" }
         val token=sessionToken?.trim().orEmpty()
-        if(token.isEmpty()) return this
+        if(token.isEmpty()) {
+            return if(deviceCookie.isEmpty()) this else copy(headers=headers+linkedMapOf("Cookie" to deviceCookie))
+        }
         val extra=linkedMapOf("x-tt-token" to token)
-        if(token.contains('=')) extra["Cookie"]=token
+        // 只有整段 Cookie（含 `=`）才同时按 `Cookie` 头发一次：纯 token 不是 Cookie 串，
+        // 混进 `Cookie` 会让服务端按 Cookie 解析。设备 Cookie 是另一回事，照常附上。
+        when {
+            token.contains('=') -> extra["Cookie"]=if(deviceCookie.isEmpty()) token else "$token; $deviceCookie"
+            deviceCookie.isNotEmpty() -> extra["Cookie"]=deviceCookie
+        }
         return copy(headers=headers+extra)
     }
+    /** 有没有可用的登录态：搜索要不要优先走 App 接口、个人信息页要不要联网，都看它。 */
+    val signedIn: Boolean get()=credentials?.configured==true || !sessionToken.isNullOrBlank()
     private fun router(url: String) = extractRouter(text(url)).getJSONObject("loaderData")
     private fun card(item: JSONObject): Series {
         val o=item.optJSONObject("video_data") ?: item
@@ -329,6 +525,9 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             var hasMore=false; var answered=false; var expired=false
             // AI 剧在 App 搜索接口里没有对应的 tab（见 [ContentType.searchable]），不请求它。
             types.filter { it in ContentType.searchable }.distinct().forEach { type ->
+                // 已经判死（空响应 = 设备没注册）就别再问另一个 tab：两个 tab 结论一致，
+                // 多问一次只是把首屏又推后一个 RTT。
+                if(appSearchAlive==false) return@forEach
                 try {
                     val result=appSearch(keyword,page,type)
                     answered=true; items+=result.items; if(result.hasMore) hasMore=true
@@ -400,7 +599,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     private fun appSearch(keyword: String, page: Int, type: ContentType): CatalogPage {
         val values=appValues()
-        values.putAll(linkedMapOf("query" to keyword,"count" to "20","offset" to ((page-1)*20).toString(),"tab_type" to type.searchTab.toString(),"bookshelf_search_plan" to "4","use_correct" to "true","user_is_login" to "0"))
+        values.putAll(linkedMapOf("query" to keyword,"count" to "20","offset" to ((page-1)*20).toString(),"tab_type" to type.searchTab.toString(),"bookshelf_search_plan" to "4","use_correct" to "true","user_is_login" to if(signedIn) "1" else "0"))
         val cursor=synchronized(searchCursors) {
             val now=clock()
             searchCursors.entries.removeAll { now-it.value.updatedAt>300000 || (page==1 && it.key.first==type && it.key.second==keyword) }
@@ -415,11 +614,27 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             it.offset?.takeIf { offset -> offset>=0 }?.let { offset -> values["offset"]=offset.toString() }
         }
         val signed=signer.sign("https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v",values)
-        val raw=text(signed.url,signed.withSession())
+        // **空响应体 = 这台设备没在服务端注册过，重发多少次都一样。**
+        //
+        // 平台按「服务端注册过的 `device_id` + `install_id`」放行：注册过的设备只回
+        // `code 0` 或间歇性 `100103`，**从不回空响应**；没注册的一律空响应。
+        // 而注册本身是匿名的（见 [registerDevice]），所以正确的做法是**去注册一台**，
+        // 而不是原地重发——旧实现在这里退避 550/800/1050/1300/1550ms 重发 5 次，
+        // 两个 tab 串行白等 12.8 秒，正是「搜索要十多秒才出结果」的来由。
+        // 现在空响应**一次即判死**，立刻走官网搜索（实测约 250ms）。
+        var raw=text(signed.url,signed.withSession())
         // 平台对匿名设备返回 HTTP 200 + 空响应体，这里必须先判空：
         // 直接丢给 JSONObject 会抛 JSONException（A JSONObject text must begin with '{'），
         // 那既不是可读的错误，也会把「App 搜索不可用、改用官网搜索」这条回退路径打断。
         if(raw.isBlank()) { appSearchAlive=false; throw IOException("App 搜索接口暂无响应") }
+        // `100103` 才是真正的间歇性错误（同一设备约一半概率），短间隔重发几次即可。
+        var attempt=0
+        while(attempt<3 && raw.startsWith("""{"code":100103""")) {
+            attempt++
+            Thread.sleep(120L)
+            raw=text(signed.url,signed.withSession())
+            if(raw.isBlank()) { appSearchAlive=false; throw IOException("App 搜索接口暂无响应") }
+        }
         appSearchAlive=true
         val data=JSONObject(raw)
         if(data.optInt("code",-1)!=0) throw IOException("搜索接口暂不可用")
@@ -443,6 +658,283 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         }
         return CatalogPage(valid(list),tab.optBoolean("has_more",false) && page<100)
     }
+    // ------------------------------------------------------------------ 账号（个人信息页）
+    /**
+     * 账号接口共用的一次请求：带登录态、带设备参数、带签名。
+     *
+     * 这些接口都在 App 域名下（与搜索 / 弹幕同一套），因此设备参数用 [appValues]；
+     * 写接口（POST + body）改用 [writeValues]——它们走的是官方 7.3.9.32 那一版，
+     * 而且平台会拿签名里的设备档案做一致性判定。
+     *
+     * 空响应体在这个平台上很常见（网关挡掉），统一翻成可读的 [IOException]，
+     * 免得把 JSONException 抛到界面上。
+     */
+    private fun accountJson(path: String, params: Map<String,String> = emptyMap(), body: ByteArray? = null): JSONObject {
+        // 账号侧接口全部要求登录态：没有凭据时**不发请求**，直接给出可辨识的失败原因。
+        if(!signedIn) throw SignInRequiredException()
+        val values=if(body!=null) writeValues() else appValues()
+        params.forEach { (key,value) -> values[key]=value }
+        val signed=signer.sign("https://$ACCOUNT_HOST$path",values,body)
+        val raw=text(signed.url,signed.withSession())
+        if(raw.isBlank()) throw IOException("账号接口暂无响应（空响应体）")
+        return JSONObject(raw)
+    }
+
+    /**
+     * 空响应体重发：这个平台上「网关偶发挡掉」很常见（实测约一半概率），
+     * 同一请求重发即可。只重试空 body，真的报错（100103 等）直接抛出去。
+     */
+    private fun retryBlank(attempts: Int = ACCOUNT_RETRIES, action: () -> JSONObject): JSONObject {
+        var last: Exception?=null
+        repeat(attempts) { attempt ->
+            try { return action() } catch(e: Exception) {
+                last=e
+                if(!e.message.orEmpty().contains("空响应体")) throw e
+                Thread.sleep(300L+attempt*250L)
+            }
+        }
+        throw last ?: IOException("账号接口暂无响应")
+    }
+
+    /**
+     * 账号资料。
+     *
+     * 两个接口一起用，因为信息是分开的（实测）：
+     * * `user/info`（不带参数 = 当前登录用户）——昵称 / 头像 / **红果号**（字段名是 `req_id`）；
+     * * `basic_info/get`——关注 / 粉丝 / 获赞三个计数。
+     *
+     * 注意 `profile/get` **必须带 `user_id`**（`?user_id=1739875314044148`），
+     * 不带参数它回 `100107 network err`；它是看**别人**的资料用的，这里不用它。
+     */
+    fun accountProfile(): AccountProfile? {
+        if(!signedIn) throw SignInRequiredException()
+        val info=runCatching { accountJson("/reading/user/info/v1/") }.getOrNull()?.optJSONObject("data")
+        val basic=runCatching { accountJson("/reading/user/basic_info/get/v1/") }.getOrNull()?.optJSONObject("data")
+        return AccountParser.profile(info,basic)
+    }
+
+    /** 我的收藏：短剧书架（`bookshelf/video/info` 带封面与简介，比 `video/list` 那份完整）。 */
+    fun accountFavorites(): List<AccountFavorite> {
+        if(!signedIn) throw SignInRequiredException()
+        return AccountParser.favorites(accountJson("/reading/bookapi/bookshelf/video/info/v1/"))
+    }
+
+    /**
+     * 观看历史。
+     *
+     * 走 `read_progress/list`（不是 `read_history/list`——后者对短剧**恒返回空列表**，
+     * 它是给小说用的）：`?book_types=2&limit=50`，短剧记录在 `video_data[]` 里。
+     * 但它**只给 series_id**，所以再用 `multi-detail` 批量补片名与封面。
+     *
+     * 补元数据这一段失败就整条抛出（那一栏显示为空并在页面上写明原因），
+     * 不返回只有 id 的条目——那在界面上是个空框，比少几条更难看。
+     */
+    fun accountHistory(): List<AccountHistory> {
+        if(!signedIn) throw SignInRequiredException()
+        val rows=AccountParser.history(accountJson("/reading/bookapi/read_progress/list/v1/",
+            mapOf("book_types" to "2","limit" to MULTI_DETAIL_LIMIT.toString())))
+        if(rows.isEmpty()) return rows
+        // 这批接口只给 series_id，片名与封面必须再来这里补。**补不到就不显示这一条**：
+        // 只留 id 的那一行在界面上是个空框（没有标题也没有封面），比少一条更糟。
+        val details=AccountParser.multiDetail(accountJson("/reading/bookapi/multi-detail/v1/",
+            mapOf("book_id" to rows.map { it.series.id }.joinToString(","),"book_type" to "2")))
+        return rows.mapNotNull { row -> details[row.series.id]?.let { row.copy(series=it) } }
+    }
+
+    /**
+     * 点赞：`ugc/action/mget` 的「我的点赞记录」。
+     *
+     * `action_type=3` 是「我点赞的」，`object_type_list=6,15,10` 是短剧相关的内容类型
+     * （实测给 16 只回空；老的 `praise/user/record` 只覆盖送花那类，短剧点赞不在里面）。
+     * 这个接口会间歇性回空响应体，重发即可。
+     */
+    fun accountLikes(): List<AccountLike> {
+        if(!signedIn) throw SignInRequiredException()
+        val params=mapOf("count" to "50","object_type_list" to "6,15,10","offset" to "0","action_type" to "3")
+        return AccountParser.likes(retryBlank { accountJson("/reading/ugc/action/mget/v1/",params) })
+    }
+
+    /**
+     * 预约 / 追更：`subscribe/list/v0` 的「预约」那一栏。
+     *
+     * `tab_type=13` 才是真数据（11/12 是空壳：`subscribe_items` 为 null）；
+     * `is_online=true` 取「已上线」，false 取「待上线」。两批合起来就是 App 里那一栏的全部。
+     */
+    fun accountReserves(): List<AccountReserve> {
+        if(!signedIn) throw SignInRequiredException()
+        val online=AccountParser.reserves(accountJson("/reading/user/subscribe/list/v0/",
+            mapOf("offset" to "0","limit" to "20","is_online" to "true","tab_type" to "13",
+                "subscribe_order_type" to "0","swipe_type" to "0","need_calendar_schema" to "false","subscribe_offset" to "0")))
+        val offline=runCatching { AccountParser.reserves(accountJson("/reading/user/subscribe/list/v0/",
+            mapOf("offset" to "0","limit" to "20","is_online" to "false","tab_type" to "13",
+                "subscribe_order_type" to "0","swipe_type" to "0","need_calendar_schema" to "false","subscribe_offset" to "0"))) }
+            .getOrDefault(emptyList())
+        return (online+offline).distinctBy { it.series.id }.sortedByDescending { it.updatedAt }
+    }
+
+    /**
+     * 账号写接口：把本机的收藏 / 观看记录同步到云端。
+     *
+     * 三个接口都是 `POST` + JSON body，body 的字段名**必须与 App 的 protobuf/gson 模型一致**
+     * （从 `com.dragon.read.rpc.model` 反编译出来的 `@SerializedName`）：
+     *
+     * * 收藏加：`bookshelf/add/v1/`，`{"book_id":["<series_id>"]}`——**数组**，给字符串会回 100103；
+     * * 收藏删：`bookshelf/video/update/v1/`，`update_bookshelf_video_list[].video_shelf_operate_type=1`（DelShelf）；
+     * * 进度 / 历史：`read_progress/upload/v1/`，`books[]` 里的字段是 **`book_id` / `item_id` /
+     *   `read_timestamp_ms`**（不是 `series_id` / `vid` / `last_watch_time`——用错名字平台照回
+     *   `code=0 SUCCESS`，但云端一个字节都不改）；`write_mode=1` = 同时写进度与历史。
+     *
+     * 写接口失败**不打扰用户**：本机记录已经落盘，云端同步只是尽力而为，返回 false 由调用方决定要不要提示。
+     */
+    fun accountAddFavorite(seriesId: String): Boolean = videoShelf(seriesId,VIDEO_SHELF_ADD_SHELF)
+
+    /** 取消收藏：`bookshelf/video/update` 的 DelShelf（`bookshelf/delete` 实测不生效）。 */
+    fun accountRemoveFavorite(seriesId: String): Boolean = videoShelf(seriesId,VIDEO_SHELF_DEL_SHELF)
+
+    /**
+     * 短剧收藏的增 / 删：`POST /reading/bookapi/bookshelf/video/update/v1/`。
+     *
+     * 短剧收藏（App 里叫「追剧」）只有这一个写接口，`bookshelf/add` 是**小说书架**，
+     * 写进 `book_shelf_info_all`，而「我的收藏」短剧那一栏读的是 `video_shelf_info`——
+     * 用错接口平台照样回 `code=0 SUCCESS`，短剧收藏却一点不变。
+     *
+     * `book_type` 用 [BOOK_TYPE_WATCH]（`ReadingBookType.Watch`）；
+     * 平台偶发 `101144 HIT_SHARK_RULE`（风控限流），重发即可——官方包自己也带 pending 重试队列。
+     */
+    private fun videoShelf(seriesId: String,operate: Int): Boolean {
+        if(!signedIn || !seriesId.matches(Regex("[0-9]{1,30}"))) return false
+        val entry=JSONObject()
+            .put("book_id",seriesId).put("book_type",BOOK_TYPE_WATCH)
+            .put("modify_time",clock())
+            .put("video_shelf_operate_type",operate)
+        // 「取消」在条目里带一个空的 `group_name`；「加入」不带。
+        if(operate==VIDEO_SHELF_DEL_SHELF) entry.put("group_name","")
+        // `shark_extra`（进入来源）是**body 的顶层字段**，不在条目里——这是 2026-10-15
+        // 从官方包抓包核对出来的（`POST /reading/bookapi/bookshelf/video/update/v`）：
+        // 官方那条请求的 body 形如
+        // `{"is_cancelled":false,"shark_extra":{…},"update_bookshelf_video_list":[{…}]}`。
+        // 早先把它塞进条目里，服务端照旧回 `101144 追剧失败`。
+        val body=JSONObject()
+            .put("is_cancelled",false)
+        if(operate==VIDEO_SHELF_ADD_SHELF) {
+            body.put("shark_extra",JSONObject()
+                .put("enter_from","MainFragmentActivity")
+                .put("previous_page","")
+                .put("page_list","MainFragmentActivity")
+                .put("is_active_behavior","true")
+                .put("inactive_type","0"))
+        }
+        body.put("update_bookshelf_video_list",JSONArray().put(entry))
+        val payload=body.toString().toByteArray()
+        // 风控是**偶发**的（同一条请求重发两三次里总有一次过），因此这里自己重试：
+        // [retryBlank] 只管空响应体，101144 要单独再发。
+        repeat(ACCOUNT_WRITE_ATTEMPTS) { attempt ->
+            var detail=""
+            val ok=runCatching {
+                val reply=accountJson("/reading/bookapi/bookshelf/video/update/v1/",emptyMap(),payload)
+                val code=reply.optInt("code",-1)
+                if(code!=0) detail="code=$code message=${reply.optString("message")}"
+                code==0
+            }.onFailure { detail="异常 ${it.message}" }.getOrDefault(false)
+            if(ok) return true
+            writeLog("收藏写接口失败 attempt=${attempt+1} operate=$operate id=$seriesId $detail")
+            if(attempt<ACCOUNT_WRITE_ATTEMPTS-1) Thread.sleep(ACCOUNT_WRITE_BACKOFF[attempt])
+        }
+        return false
+    }
+
+    /**
+     * 上传观看进度（`write_mode=1` 会同时写进「历史」）。
+     *
+     * [episodeCount] 只用于云端「全 N 集」的展示，未知时传 0；
+     * `progress_rate` 是 0~1 的小数串，平台用它画进度条。
+     */
+    fun accountUploadProgress(seriesId: String,episodeId: String,episodeIndex: Int,position: Long,duration: Long,episodeCount: Int=0): Boolean {
+        if(!signedIn || !seriesId.matches(Regex("[0-9]{1,30}"))) return false
+        if(!episodeId.matches(Regex("[0-9]{1,30}"))) return false
+        val rate=if(duration>0) (position.toDouble()/duration).coerceIn(0.0,1.0) else 0.0
+        val entry=JSONObject()
+            .put("book_id",seriesId)
+            .put("item_id",episodeId)
+            .put("vid_index",episodeIndex+1)
+            .put("current_play_time",position.coerceAtLeast(0))
+            .put("current_total_time",duration.coerceAtLeast(0))
+            .put("episode_count",episodeCount.coerceAtLeast(0))
+            .put("read_timestamp_ms",clock())
+            .put("book_type",BOOK_TYPE_WATCH)
+            .put("progress_rate","%.4f".format(java.util.Locale.US,rate))
+            .put("player_cumulative_total_duration",position.coerceAtLeast(0))
+        val body=JSONObject().put("books",JSONArray().put(entry)).put("write_mode",1).toString().toByteArray()
+        repeat(ACCOUNT_WRITE_ATTEMPTS) { attempt ->
+            var detail=""
+            val ok=runCatching {
+                val reply=accountJson("/reading/bookapi/read_progress/upload/v1/",emptyMap(),body)
+                val code=reply.optInt("code",-1)
+                if(code!=0) detail="code=$code message=${reply.optString("message")}"
+                code==0
+            }.onFailure { detail="异常 ${it.message}" }.getOrDefault(false)
+            if(ok) return true
+            writeLog("进度写接口失败 attempt=${attempt+1} id=$seriesId $detail")
+            if(attempt<ACCOUNT_WRITE_ATTEMPTS-1) Thread.sleep(ACCOUNT_WRITE_BACKOFF[attempt])
+        }
+        return false
+    }
+
+    /**
+     * 删除一条云端观看历史。
+     *
+     * 实测：`read_history/update` 必须带 `is_delete=true` + **`use_soft_delete=true`** +
+     * `update_timestamp_ms`（带 `read_timestamp_ms` 会被放进 `update_fail_datas` 里拒绝）；
+     * `book_id` 要给**数字**（字符串会被判 `100103`）。
+     */
+    fun accountDeleteHistory(seriesId: String): Boolean {
+        if(!signedIn || !seriesId.matches(Regex("[0-9]{1,30}"))) return false
+        val entry=JSONObject()
+            .put("book_id",seriesId.toLong())
+            .put("book_type",BOOK_TYPE_WATCH)
+            .put("is_delete",true)
+            .put("use_soft_delete",true)
+            .put("update_timestamp_ms",clock())
+        val body=JSONObject().put("update_datas",JSONArray().put(entry)).toString().toByteArray()
+        return runCatching {
+            val reply=accountJson("/reading/bookapi/read_history/update/v1/",emptyMap(),body)
+            val code=reply.optInt("code",-1)
+            val failed=(reply.optJSONObject("data")?.optJSONArray("update_fail_datas")?.length() ?: 0)
+            if(code!=0 || failed>0) writeLog("历史删除写接口失败 id=$seriesId code=$code failed=$failed message=${reply.optString("message")}")
+            code==0 && failed==0
+        }.onFailure { writeLog("历史删除写接口异常 id=$seriesId ${it.message}") }.getOrDefault(false)
+    }
+
+    /**
+     * 个人信息页要的全部内容：资料 + 四条列表，一次拉齐。
+     *
+     * 四条列表彼此独立：某一条失败只让它空着、把原因记进 [AccountData.errors]，
+     * 其余三条照常显示。资料拉不到（或没配登录态）时 [AccountData.profile] 为 null，
+     * 界面据此提示「需要先导入参数」。
+     */
+    fun accountData(): AccountData {
+        // 未导入凭据时抛 [SignInRequiredException]（而不是回一份空数据）：
+        // 空数据在界面上与「这个账号真的一条记录都没有」无法区分。
+        if(!signedIn) throw SignInRequiredException()
+        val errors=java.util.concurrent.ConcurrentHashMap<String,String>()
+        fun <T> part(name: String, action: ()->T, fallback: T): T = try { action() } catch(e: Exception) {
+            errors[name]=e.message.orEmpty().take(120); fallback
+        }
+        // 五个任务**并发**发出去：它们彼此独立，串行发要两三秒（每个请求都带签名，
+        // 平台首包 200~600ms，个别还要重试）。并发之后整体耗时取决于最慢的那一个。
+        val profile=accountPool.submit<AccountProfile?> { part("资料",{accountProfile()},null) }
+        val favorites=accountPool.submit<List<AccountFavorite>> { part("收藏",{accountFavorites()},emptyList()) }
+        val history=accountPool.submit<List<AccountHistory>> { part("历史",{accountHistory()},emptyList()) }
+        val likes=accountPool.submit<List<AccountLike>> { part("点赞",{accountLikes()},emptyList()) }
+        val reserves=accountPool.submit<List<AccountReserve>> { part("预约",{accountReserves()},emptyList()) }
+        fun <T> take(future: java.util.concurrent.Future<T>, fallback: T): T =
+            runCatching { future.get() }.getOrDefault(fallback)
+        return AccountData(
+            take(profile,null),take(favorites,emptyList()),take(history,emptyList()),
+            take(likes,emptyList()),take(reserves,emptyList()),errors.toMap()
+        )
+    }
+
     fun detail(id: String): Detail {
         require(id.matches(Regex("[0-9]{1,30}")))
         val html=text("$site/detail?series_id=$id")
@@ -450,28 +942,57 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val raw=o.optJSONArray("vid_list") ?: throw IOException("分集暂不可用")
         val episodes=(0 until raw.length()).map { raw.getString(it) }
         if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
-        // 简介页下方那一栏：先是同一部剧的其它季（平台没有分季接口，用基名搜索近似），
-        // 再接官网详情页第二段数据里的相关短剧（`mergeLoaderData` 注入的 recommendations）。
-        // 两段都取不到就当作没有相关内容：详情本身必须能打开，不能因为这一栏而报错。
-        // 这里**不**去找同系列：那要额外发搜索请求，详情页每次进都要开一次，
-        // 挂在这里会让「进简介页」变慢。相关剧集在界面点开时才取（见 [related]）。
+        // 简介页下方那一栏不在这里取：它是 App 详情页的「相关作品」cell
+        // （`GET /reading/bookapi/plan/v:version/`，见 [related]），要额外发一次请求，
+        // 挂在详情上会让每次进简介页都多等一个 RTT。界面在详情上屏之后后台预取。
         return Detail(card(o).copy(id=id),episodes)
     }
     /**
-     * 相关短剧：官网详情页里「相关短剧」那一栏的内容。
+     * 相关作品：App 详情页「相关作品」那一栏的内容，**一次请求拿全**（替代原先那套
+     * 「官网搜索 + 沿季号逐季搜 + 扫 6 页片库目录」的召回：实测 2~4s、还要二十多次请求）。
      *
-     * 数据不在 `_ROUTER_DATA.detail_page` 里，而是同一份 HTML 后面那段
-     * `<script data-fn-name="mergeLoaderData" data-fn-args="…">`（HTML 实体转义过的 JSON 数组，
-     * 内层 `routerDataFnArgs[0]` 又是一层 JSON 字符串）。取 `recommendationGroups.related_list`，
-     * 缺失时退回同一层的 `videoList`（实测两者内容一致）。
+     * ```
+     * GET https://{线路}/reading/bookapi/plan/v:version/
+     *     ?scene=10&from=detail_page_more_related&book_id={剧集 ID}（见 [relatedRows]）
+     * ```
+     *
+     * 这一栏**不在**官网详情页里，而是 App 详情页自己那个 cell：
+     * `data[]` 里 `show_type=547` / `cell_name="相关作品"` 的 `video_data[]`，
+     * 每条带 `season_index`（季号）、`tag_info.text`（`第N季` / `同IP`）与完整的卡片字段。
+     * 实测一次给全：万妖图录传 26 条（13 季 + 13 部同 IP）、聚宝仙盆 45 条。
+     *
+     * [title] 是正在看的那一部的剧名（界面手里就有，不用再取一次详情）。
+     * 用它按 [SeriesSeasons.normalize] 把同一部剧的各季挑出来——**不能只看 `tag_info`**：
+     * 万妖图录传第一季那一页的 `第N季` 组里混着「月落镇魔第二季」这种同 IP 的另一个系列。
+     *
+     * 同系列各季（按季号升序）排在前面，其余相关作品接在后面、按剧集 ID 去重；
+     * 正在看的那一部本身不出现（它自己就是当前页）。接口整轮失败时退回官网详情页的
+     * 「相关短剧」（`recommendationGroups.related_list`，一次 HTML 请求，不做任何搜索）。
      */
-    fun related(id: String): RelatedWorks {
+    fun related(id: String, title: String = ""): RelatedWorks {
         require(id.matches(Regex("[0-9]{1,30}")))
+        val current=title.trim()
+        if(current.isNotEmpty()) synchronized(relatedCache) { relatedCache[id]?.let { return it } }
+        val rows=runCatching { relatedRows(id) }.getOrNull().orEmpty()
+        if(rows.isNotEmpty()) {
+            val seasons=SeriesSeasons.siblings(current,rows.map { it.series })
+            val seasonIds=seasons.map { it.id }.toSet()
+            val others=rows.map { it.series }.filter { it.id!=id && it.id !in seasonIds }
+            val works=RelatedWorks(seasons+others,seasons)
+            if(current.isNotEmpty()) synchronized(relatedCache) {
+                if(relatedCache.size>=RELATED_CACHE_LIMIT) relatedCache.keys.firstOrNull()?.let(relatedCache::remove)
+                relatedCache[id]=works
+            }
+            return works
+        }
+        // 兜底：官网详情页第二段数据里的「相关短剧」。剧名在参数里没给时顺手从详情里读一次。
         val html=text("$site/detail?series_id=$id")
         val series=extractRouter(html).getJSONObject("loaderData").optJSONObject("detail_page")
             ?.optJSONObject("seriesDetail")?.let { card(it).copy(id=id) } ?: return RelatedWorks(emptyList(),emptyList())
-        val seasons=seasonSiblings(series)
-        return RelatedWorks(relatedFor(series,seasons,html),seasons)
+        val fallback=relatedOf(html,id)
+        val seasons=SeriesSeasons.siblings(current.ifEmpty { series.title },fallback)
+        val seasonIds=seasons.map { it.id }.toSet()
+        return RelatedWorks(seasons+fallback.filter { it.id !in seasonIds },seasons)
     }
     /** 从已经取到的详情页 HTML 里解析相关短剧；解析失败返回空列表。 */
     private fun relatedOf(html: String,id: String): List<Series> = runCatching {
@@ -482,100 +1003,73 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }.getOrDefault(emptyList())
 
     /**
-     * 简介页下方那一栏的内容：**同一部剧的其它季**在前，官网的相关短剧在后，重复的去掉。
+     * 「相关作品」里的一条：卡片 + 平台给的 `tag_info.text`（`第N季` / `同IP`）。
      *
-     * 平台没有「分季」接口——详情页里没有任何季 / 系列字段，页面上那栏「相关短剧」
-     * （`recommendationGroups.related_list`）是「看了这部还看什么」的推荐，不是同系列。
-     * 能拿到同系列各季的只有官网搜索：用剥掉季号的**基名**去搜（实测搜基名时同一系列的各季
-     * 都排在前 10 条里），再用 [SeriesSeasons.normalize] 过滤出真正同名的系列、按季号升序排列。
-     *
-     * 搜索失败或没有同系列时这一段为空，不影响后面的相关短剧。
+     * [tag] 只当参考：界面上的季号仍由剧名推出来（见 [SeriesSeasons.badge]），
+     * 因为同一个值在列表接口里没有、只有这一栏才有，两处得用同一套规则才不会互相打架。
      */
-    private fun relatedFor(series: Series,seasons: List<Series>,html: String): List<Series> {
-        val seen=seasons.map { it.id }.toMutableSet()
-        // 相关短剧接在同系列之后；已经在前面出现过的（同剧不同季）不再重复。
-        // 正在看的那一部本身也排除：界面上它就是当前页，不需要再出现在列表里。
-        val others=relatedOf(html,series.id).filter { it.id!=series.id && seen.add(it.id) }
-        return seasons+others
-    }
-    /**
-     * 同一部剧的各季（按季号升序，含正在看的那一季）。取不到时返回空列表。
-     *
-     * 一次搜索只给约 10 条，而同系列的季数可能有十几季（实测「聚宝仙盆之杂灵根才是真BOSS」
-     * 有 96 条同名结果），因此往后多取几页再合并：第 2 页起走的是片库目录扫描，
-     * 结果可能与前页重复，这里按 id 去重。取到 [SEASON_PAGE_LIMIT] 页或没有下一页就停。
-     */
-    fun seasonSiblings(series: Series): List<Series> {
-        val base=SeriesSeasons.base(series.title)
-        if(base.length<2) return emptyList()
-        synchronized(seasonCache) {
-            seasonCache[base]?.let { return it }
-        }
-        val found=SeriesSeasons.siblings(series.title,seasonCandidates(series.title,base))
-        synchronized(seasonCache) {
-            if(seasonCache.size>=SEASON_CACHE_LIMIT) seasonCache.keys.firstOrNull()?.let(seasonCache::remove)
-            seasonCache[base]=found
-        }
-        return found
-    }
-    /**
-     * 找同系列各季时用到的候选：三条路合并，按 id 去重。
-     *
-     * 官网搜索**只有 10 条**、而且忽略分页参数（实测 `?page=2/3`、`?page_num`、`?offset`、
-     * `?pageNo`、`?p`、`?limit` 全部返回同一批），因此单靠一次搜索召回很有限。
-     * 但**换关键词就是换一批**，所以：
-     *
-     * 1. **沿季号逐季搜**：当前第 N 季 → 搜「第 N+1 季」，命中就继续「第 N+2 季」……
-     *    每个季号关键词带回的是不同的那 10 条，中文（`第十四季`）与阿拉伯（`第14季`）各试一次；
-     *    连续 [SEASON_MISS_LIMIT] 个季号都没命中就停，上限 [SEASON_SEARCH_LIMIT] 季；
-     * 2. **基名与去尾字**：基名本身搜一次（第 1 季的剧名常常就是基名），
-     *    再去掉 1~3 个尾字各搜一次（模糊匹配能把被挤出前 10 的同系列捞回来）；
-     * 3. **片库目录扫描**：`/category/real-drama?page=N` 每页 24 部、共 34 页（约 800 部），
-     *    里面还有被搜索挤掉的那部分同系列——这是唯一能突破「只有 10 条」的入口，
-     *    扫到 [SEASON_CATALOG_PAGES] 页或连续两页无新增为止。
-     */
-    private fun seasonCandidates(title: String,base: String): List<Series> {
-        // 串行发十几个请求要一分多钟，因此全部丢进一个小线程池并发跑（4 路），
-        // 结果用同步 Map 收集；线程是 daemon，不会拦住进程退出。
-        val found=java.util.Collections.synchronizedMap(linkedMapOf<String,Series>())
-        fun keep(rows: List<Series>) { rows.forEach { found.putIfAbsent(it.id,it) } }
-        val current=SeriesSeasons.season(title)
+    private data class RelatedEntry(val series: Series, val tag: String)
 
-        // 阶段一（并发）：基名 + 去掉 1~3 个尾字各搜一次，再扫几页片库目录。
-        val first= mutableListOf<java.util.concurrent.Callable<Unit>>()
-        val keywords=linkedSetOf(base)
-        for(cut in 1..SEASON_SEARCH_TRIMS) base.dropLast(cut).takeIf { it.length>=2 }?.let(keywords::add)
-        keywords.forEach { keyword -> first += java.util.concurrent.Callable {
-            keep(runCatching { search(keyword,1) }.getOrNull()?.items.orEmpty())
-        } }
-        for(page in 1..SEASON_CATALOG_PAGES) first += java.util.concurrent.Callable {
-            keep(runCatching { catalogPage(base,page,ContentType.SHORT).first }.getOrDefault(emptyList()))
+    /**
+     * 取「相关作品」那一栏的原始条目。
+     *
+     * 请求体（query）按官方 App 的形态给：`scene=10`、`from=detail_page_more_related`、
+     * `book_id={剧集 ID}`，外加设备参数与签名（见 [appValues] / [Signer]）。
+     * `from` 必须正是 `detail_page_more_related`：换别的取值服务端一律回空响应体。
+     *
+     * **空响应体是常态**（HTTP 200 + 0 字节，实测约一半概率），与设备是否注册无关：
+     * 同一条线路连发几次里总有一次成功，所以这里换线重发、拿到 `code 0` 就返回；
+     * 六条线路轮一圈都拿不到才抛出去，由 [related] 走官网兜底。
+     */
+    private fun relatedRows(id: String): List<RelatedEntry> {
+        var failure: IOException?=null
+        for(attempt in 0 until RELATED_ATTEMPTS) {
+            val host=relatedHosts[attempt%relatedHosts.size]
+            val values=appValues()
+            values.putAll(linkedMapOf(
+                "scene" to "10","from" to "detail_page_more_related","book_id" to id,
+                "new_search_middle_page" to "false","bookstore_tab_type" to "0",
+                "query_history_removed" to "false","user_is_login" to if(signedIn) "1" else "0",
+                "bookstore_tab" to "0","search_middle_page_version" to "0","pad_column_detail" to "0",
+                "hot_word_exchange" to "false","device_level" to "3","limit" to "0","offset" to "0",
+                "is_horizontal_screen" to "false","reader_single_col_from_ip_strategy" to "false"
+            ))
+            try {
+                val signed=signer.sign("https://$host/reading/bookapi/plan/v:version/",values)
+                val raw=text(signed.url,signed.withSession())
+                if(raw.isBlank()) { failure=IOException("相关作品接口暂无响应"); continue }
+                val data=JSONObject(raw)
+                if(data.optInt("code",-1)!=0) {
+                    failure=IOException("相关作品接口暂不可用（${data.optInt("code")}）"); continue
+                }
+                val rows=parseRelatedRows(data)
+                if(rows.isNotEmpty()) return rows
+                failure=IOException("相关作品数据为空")
+            } catch(e: Exception) {
+                failure=e as? IOException ?: IOException(e.message ?: "相关作品请求失败")
+            }
         }
-        relatedPool.invokeAll(first)
-
-        // 阶段二（并发）：从当前季的**下一季**开始往上逐季搜，命中就继续，
-        // 连续 [SEASON_MISS_LIMIT] 个季号都没命中就停；上限 [SEASON_LOOKAHEAD] 个季号。
-        // 每个季号中文与阿拉伯两种写法各发一次，两条一起等。
-        // 逐个季号搜过去：1 到「当前季 + [SEASON_LOOKAHEAD]」，**并发**发出去。
-        // 只往上搜是不够的——当前就是最新一季时（比如第十三季），第 2/9 季这些**更早**的季
-        // 只能靠搜它们自己的季号命中；而每个季号关键词带回的 10 条里往往包含好几个季，
-        // 逐个搜一遍就能覆盖到。中文写法优先（平台上剧名基本用中文数字），
-        // 整轮一个都没命中时才补一轮阿拉伯写法（少见情况，代价可控）。
-        val seasons=(1..minOf(current+SEASON_LOOKAHEAD,SEASON_SEARCH_LIMIT)).toList()
-        fun searchSeason(label: String): Boolean {
-            val rows=runCatching { search(base+label,1) }.getOrNull()?.items.orEmpty()
-            keep(rows)
-            return rows.any { SeriesSeasons.normalize(it.title)==SeriesSeasons.normalize(title) }
+        throw failure ?: IOException("相关作品接口暂不可用")
+    }
+    /** 从「相关作品」响应里取出那一栏的卡片；结构与官网卡片同构，直接复用 [card] 的字段映射。 */
+    private fun parseRelatedRows(data: JSONObject): List<RelatedEntry> {
+        val cells=data.optJSONArray("data") ?: return emptyList()
+        val rows=linkedMapOf<String,RelatedEntry>()
+        for(cell in cells.objects()) {
+            if(cell.optInt("show_type")!=RELATED_CELL_SHOW_TYPE && cell.str("cell_name")!=RELATED_CELL_NAME) continue
+            for(v in (cell.optJSONArray("video_data") ?: JSONArray()).objects()) {
+                val seriesId=v.str("series_id")
+                val title=v.str("title")
+                if(!seriesId.matches(Regex("[0-9]{1,30}")) || title.isBlank()) continue
+                val count=v.optInt("episode_cnt")
+                rows.putIfAbsent(seriesId,RelatedEntry(
+                    Series(seriesId,title,cleanUrl(v.str("cover")),v.str("video_desc"),
+                        if(count>0) "全 $count 集" else "",""),
+                    v.optJSONObject("tag_info")?.str("text").orEmpty()
+                ))
+            }
         }
-        val chineseHits=relatedPool.invokeAll(seasons.map { season ->
-            java.util.concurrent.Callable { searchSeason(SeriesSeasons.labels(season).first()) }
-        }).map { runCatching { it.get() }.getOrDefault(false) }
-        if(chineseHits.none { it }) {
-            relatedPool.invokeAll(seasons.map { season ->
-                java.util.concurrent.Callable { searchSeason(SeriesSeasons.labels(season).last()) }
-            })
-        }
-        return found.values.toList()
+        return rows.values.toList()
     }
     /**
      * 取一集的播放模型（`video_model`）。
@@ -592,6 +1086,15 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      *
      * **空响应体必须当失败**：网关在业务处理前挡掉请求时就是 `200 + 0 字节`，
      * 这时业务码取不到、默认成 0，不判空就会被当成成功往下走（0.15.0 那次改版栽的就是这个）。
+     *
+     * 2026-10-15 平台又加了一道门槛：**匿名请求一律 `200 + 0 字节`**，路径与请求体都没变，
+     * 因此五条候选路径会全部走完、最后抛出最后一条的错误码（`110001`），
+     * 表现出来还是「所有影片都放不了」。带上账号 Cookie 后同一个请求 15/15 稳定命中 `code 0`，
+     * 所以这里给播放请求补上 `Cookie` 头。
+     *
+     * 补的**只有** `Cookie`：这个接口对 `x-tt-token` 的长度敏感（实测 ≥99 字符直接判死），
+     * 而账号凭据那份整段 cookie 串有 800 多字符，同时塞进 `x-tt-token` 会让请求回空
+     *（搜索接口容忍这种写法，播放接口不容忍——真 App 用的是 355 字符的 hex token）。
      */
     private fun videoModel(id: String): JSONObject {
         val host="https://api5-normal-sinfonlineb.fqnovel.com"
@@ -609,9 +1112,25 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         candidates.forEach { (path,body) ->
             val attempt=runCatching {
                 val payload=body.toByteArray()
-                val signed=signer.sign(host+path,VendorConstants.device,payload)
-                val response=text(signed.url,signed)
-                // 网关挡掉请求时是 200 + 0 字节：业务码取不到会默认成 0，必须先判空。
+                // 播放接口对**匿名设备**也放行（官方 App 冷启动未登录即可播放，见 HAR），
+                // 前提是这台设备已在服务端注册过（见 [registerDevice]）：未注册回 `101000 服务异常`
+                // 或 `200 + 0 字节`，注册后回 `code 0` + 完整播放模型。
+                // 因此这里用合并档案（含本机身份，见 [deviceProfile]），并带上注册下发的设备 Cookie；
+                // 有账号凭据时以凭据的整段 Cookie 为准。
+                val cookie=credentials?.cookie?.takeIf { it.isNotBlank() }
+                    ?: registrationCookies.entries.joinToString("; ") { (name,value) -> "$name=$value" }.takeIf { it.isNotEmpty() }
+                var response=""
+                var blankRetry=0
+                while(true) {
+                    val signed=signer.sign(host+path,deviceProfile(),payload)
+                    val request=if(cookie==null) signed else signed.copy(headers=signed.headers+linkedMapOf("Cookie" to cookie))
+                    response=text(signed.url,request)
+                    // 网关挡掉请求时是 200 + 0 字节：业务码取不到会默认成 0，必须先判空。
+                    // 空响应先原地重发几次再换下一条：否则会把唯一能用的那条路径也跳过去。
+                    if(response.isNotBlank() || blankRetry>=PLAYBACK_RETRIES) break
+                    blankRetry++
+                    Thread.sleep(200L+blankRetry*200L)
+                }
                 if(response.isBlank()) throw IOException("播放接口暂不可用（空响应）")
                 val data=JSONObject(response)
                 val code=data.optInt("Code",data.optInt("code",0))

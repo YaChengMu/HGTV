@@ -88,10 +88,14 @@ class ContentRepositoryTest {
             }
         }
         assertEquals("https://example.com/stream",repo.stream("123").url)
-        assertEquals(listOf(
-            "/novel/player/video_model/v1/",
-            "/novel/player/multi_video_model/preload/v1/"
-        ),paths)
+        // 空响应会**原地重发几次**再换下一路（网关偶发挡掉时重发即好，见 `PLAYBACK_RETRIES`），
+        // 因此这里只钉住顺序：同一路可以重复，但必须**依次**走过、最终落到下一条。
+        assertEquals(
+            listOf("/novel/player/video_model/v1/","/novel/player/multi_video_model/preload/v1/"),
+            paths.distinct()
+        )
+        assertTrue(paths.first()=="/novel/player/video_model/v1/")
+        assertTrue(paths.last()=="/novel/player/multi_video_model/preload/v1/")
     }
 
     /** 新路由通了但没给 `video_model`（例如只有 `data.disable_vsr` 这类字段）时也要继续换路。 */
@@ -107,12 +111,13 @@ class ContentRepositoryTest {
             }
         }
         assertEquals("https://example.com/stream",repo.stream("123").url)
+        // 同前：每一条都可能重发几次，只钉住「依次走过、最终落到给得出模型的那条」。
         assertEquals(listOf(
             "/novel/player/video_model/v1/",
             "/novel/player/multi_video_model/preload/v1/",
             "/novel/player/multi_video_model/default/v1/",
             "/novel/player/multi_video_model/detail/v1/"
-        ),paths)
+        ),paths.distinct())
     }
 
     /** 新路由不可用时退回旧路径：老账号 / 灰度环境上仍然要能播。 */

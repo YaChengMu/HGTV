@@ -1,6 +1,6 @@
 # 红果短剧接口参考
 
-本文件整理红果短剧（`com.phoenix.read`，内容侧与番茄小说同源）在**匿名设备**下可用的接口。
+本文件整理红果短剧（`com.phoenix.read`，内容侧与番茄小说同源）的客户端接口。
 内容分两层：
 
 - **官网层**（`https://hongguoduanju.com`）：Next.js SSR 页面，数据藏在 HTML 的 `_ROUTER_DATA` 里，
@@ -30,6 +30,7 @@
 | App 接口（备用） | `https://api5-normal-sinfonlinec.fqnovel.com`、`https://api5-normal-sinfonlineb.fqnovel.com` |
 | App 接口（备用） | `https://api5-normal-lf.fqnovel.com`、`https://api5-normal-lq.fqnovel.com`、`https://api5-normal-hl.fqnovel.com` |
 | 播放地址解析 | `https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/`（2026-10-14 起；旧路径见 4.3） |
+| 设备注册 | `https://log5-applog-lf.fqnovel.com/service/2/device_register/`（App 接口的准入前提，见 [DEVICE_REGISTER.md](DEVICE_REGISTER.md)） |
 | 弹幕 | 上述六条线路，按 `sinfonlinea → c → b → lf → lq → hl` 顺序失败转移 |
 | 视频 CDN | 由播放接口返回的 `fallback_api` 给出，域名随资源与调度变化，不要写死 |
 
@@ -46,8 +47,8 @@
 
 | 字段 | 值 | 说明 |
 | --- | --- | --- |
-| `iid` | `1905892595382586` | 安装 ID |
-| `device_id` | `1905892595378490` | 设备 ID |
+| `iid` | `1905892595382586` | 安装 ID。**必须与 `device_id` 成对且已在服务端注册**（见 [DEVICE_REGISTER.md](DEVICE_REGISTER.md)） |
+| `device_id` | `1905892595378490` | 设备 ID。上表这个内置值是第三方共用的旧值，**已被平台拉黑**，实现里用注册下发的那对 |
 | `ac` | `wifi` | 网络类型 |
 | `channel` | `update_64` | 渠道 |
 | `aid` | `8662` | 应用 ID（红果短剧） |
@@ -77,6 +78,15 @@
 即上表的 `version_code` / `version_name` / `manifest_version_code` / `update_version_code` / `pv_player`
 五项改成 72232 / 7.2.2.32）。**搜索与弹幕用 App 版本，播放地址解析用播放器版本**，
 混用会被平台按旧客户端处理。
+
+### 2.1.1 设备注册（App 接口的准入前提）
+
+上表的 `iid` / `device_id` **不是随便填的**：平台按这一对放行，只有**服务端注册过的**
+那一对才拿得到数据。注册是匿名的、一次请求即可，协议与踩过的坑见
+[DEVICE_REGISTER.md](DEVICE_REGISTER.md)。
+
+> 没注册的设备：App 搜索回 `HTTP 200 + 0 字节`，播放回 `101000 服务异常`。
+> 这曾经被误读成「要求登录态」——实际门槛是设备，与账号无关。
 
 ### 2.2 签名（App 接口必需）
 
@@ -258,43 +268,15 @@ route-key：`detail_page`。
 - 解析失败一律返回空列表——相关短剧只是详情页的附加内容，不能影响详情本身。
 - 联调：`./android/gradlew -p android --offline :core:run --args="--related 7691228619774905368"`。
 
-#### 3.4.2 同一部剧的其它季（平台没有分季接口）
+#### 3.4.2 同一部剧的其它季（走 App 详情页的「相关作品」接口）
 
-平台**没有**「分季 / 系列」接口，能确认这一点的地方有三处：
+官网详情页里**没有**同系列各季，也没有分季接口；能一次拿全的是 **App 详情页那一栏
+「相关作品」**（见 4.6）。客户端现在就用它，不再做「官网搜索 + 沿季号逐季搜 + 扫片库目录」
+那套近似召回（实测 2~4s、二十多次请求，且召回不稳定）。
 
-| 位置 | 结论 |
-| --- | --- |
-| `seriesDetail` 全字段 | 只有当前这一季，没有任何 season / series_group / album 字段 |
-| `recommendationGroups.related_list` | 是「看了这部还看什么」的推荐，不是同系列（第十三季的相关里混着别的剧） |
-| `recommendationGroups.hot_list` | 同页热门栏，与本剧无关 |
-
-可行的近似做法（`ContentRepository.seasonSiblings` + `core/SeriesSeasons.kt`）：
-
-1. **基名**：剥掉剧名尾部的季号——`第X季` / `第X部` / `X季` / `SX` / `Season X`，
-   中文数字（`十三`）与阿拉伯数字（`13`）都认，`第一季` 归一为第 1 季，没有季号算第 1 季；
-2. **沿季号逐季搜**：官网搜索 `GET /search/{关键词}` **一次只回 10 条、且忽略所有分页参数**
-   （实测 `?page=2/3`、`?page_num`、`?offset`、`?pageNo`、`?p`、`?limit` 全部返回同一批），
-   但**换关键词就是换一批**。因此按季号逐个搜：搜 1 到「当前季 + 2」的每个季号
-   （`第三季` → `第四季` → `第五季`…），中文写法优先、整轮无命中才补阿拉伯写法。
-   **不能只往上搜**：当前是最新一季时，更早的那几季只能靠搜它们自己的季号命中；
-   每个季号带回的 10 条里往往包含好几个季，逐个搜一遍就都覆盖到了。
-   另外再用完整基名搜一次（第 1 季的剧名常常就是基名），并去掉 1~3 个尾字各搜一次；
-3. **片库目录补漏**：`/category/real-drama?page=N` 每页 24 部、共 34 页（约 800 部），
-   稳定分页，是召回的最后一道保险（实测 6 页能把 13 季凑齐）。最多扫 6 页；
-   **并发**：以上请求彼此独立，二十多个串行要一分多钟（实测 1m49s），
-   因此客户端走 4 路线程池并发，整轮约 2~3s；
-4. **筛选**：候选剧名同样剥季号、全角转半角、去空白与标点后与基名**完全相同**才算同一系列
-   （否则 `咱家剑宗团宠小师妹第五季` 会被当成 `一梦青玄，团宠小师妹一剑毁天灭地` 的兄弟）；
-5. **排序**：按季号升序，季号相同按剧名兜底；
-6. **时机与缓存**：详情接口不带相关剧集（否则每次进简介页都要多等 2s 左右）；
-   客户端在**详情内容上屏之后立刻后台预取**（`prefetchRelated`），用户点开「相关剧集」时
-   通常已经就绪、不再发请求；同一部剧不重复预取（`relatedFor`），结果另按基名缓存在内存里。
-
-局限（如实写在这里，别当成平台的正式能力）：剧名写法不统一时（改名、副标题变化、
-外传与正片同名）会漏掉或混入；平台若把同一系列拆成不同基名（如
-`聚宝仙盆仙界篇` 与 `聚宝仙盆之杂灵根才是真BOSS`）也会各算一系列。
-因此客户端把这一栏做成「同系列各季 + 相关短剧」的合并列表：同系列按季号排在最前，
-之后接 `related_list` 的内容，重复的按剧集 ID 去掉。
+官网这一侧只保留一个兜底：`mergeLoaderData` 里的 `recommendationGroups.related_list`
+（16 条「看了这部还看什么」的推荐，见 3.4.1），接口整轮失败时用它填那一栏，
+**不发任何搜索请求**。
 
 ### 3.5 官网搜索（第 1 页兜底）
 
@@ -310,7 +292,7 @@ route-key：`search_(keyword)/page`（部分响应是 `search_page`）。
 
 **`page` 参数被服务端忽略**：`page` / `page_num` / `offset` / `page_size` / `count` 试过都一样，
 一次只给相关度最高的约 10 条，`totalCount` 却显示 200 左右。所以它只负责第 1 页：
-App 搜索接口对匿名设备返回空响应时，客户端退回到这里取第 1 页，第 2 页起改用片库目录（3.3）。
+App 搜索拿不到数据时（设备未注册），客户端退回到这里取第 1 页，第 2 页起改用片库目录（3.3）。
 
 ### 3.5.1 搜索提示词（联想词）
 
@@ -327,7 +309,7 @@ GET https://hongguoduanju.com/incent_resource/suggestion?app_id=8662&web_id={随
 | `count` | 条数，有效上限 **20**（传 100 也只回 20），不传按 10 |
 | `web_id` | 官网每次页面加载生成的随机标识。**可省**，服务端不校验它与会话的对应关系 |
 
-**不需要签名、不需要登录态**（与 App 搜索接口不同，匿名设备也能拿到数据），实测延迟约 70ms。
+**不需要签名、不需要设备注册**（与 App 搜索接口不同），实测延迟约 70ms。
 
 ```json
 { "suggest_list": [
@@ -497,20 +479,28 @@ query 除设备参数（**App 版本 7.2.2.32**）外：
 - 游标（`search_id` / `passback` / `next_offset`）按「类型 + 关键词 + 页码」缓存 300 秒，
   最多 100 条；漫剧翻页缺游标时抛「搜索结果已过期，请从第 1 页重新搜索」。
 
-> **搜索的路径**：客户端（Kotlin 原生版与本地内容服务）先请求这个接口，第 2 页起带上一页的游标；
-> 匿名设备下它返回空响应体，此时退回官网搜索（第 1 页）+ 片库目录（第 2 页起）。
+> **搜索的路径**：客户端先请求这个接口，第 2 页起带上一页的游标；
+> 拿不到数据时退回官网搜索（第 1 页）+ 片库目录（第 2 页起）。
 
-> **匿名设备当前拿不到数据**：平台对未登录设备返回 **HTTP 200 + 空响应体**
-> （六条线路、多组设备参数、GET / POST、全新设备标识都一样，2026-10-09 复测）。
-> 因此必须**先判空**再解析——直接丢给 JSON 解析器会抛 `A JSONObject text must begin with '{'`，
-> 把回退路径打断。带上登录态（`x-tt-token`，整段 Cookie 也可以）后接口按该账号返回数据，
-> 搜索第 1 页起就直接用它：原生版在「设置 → 搜索登录态」用手机扫码填写（可选，不填走上面的兜底），
-> 内容服务读 `HONGGUO_SESSION_TOKEN`。
-> 同一套设备参数请求播放地址解析仍然正常（`code: 0`），可见这是搜索接口自己的登录门槛。
+> **门槛是「设备已注册」，不是登录态。** 平台按 `device_id` + `install_id` 这一对放行：
+> 注册过的设备回 `code 0` 或间歇性 `100103`，**从不回空响应**；没注册的一律
+> **HTTP 200 + 空响应体**。因此必须**先判空**再解析——直接丢给 JSON 解析器会抛
+> `A JSONObject text must begin with '{'`，把回退路径打断。
+> 注册是匿名的，协议见 [DEVICE_REGISTER.md](DEVICE_REGISTER.md)；
+> 注册后本接口第 1 页起就能用，一次 6–20 条、带游标可翻页。
+>
+> 空响应**不要原地重试**：它表示「这台设备没注册」，重发多少次都一样
+> （旧实现退避 5 次 × 2 个 tab ≈ 12.8 秒，搜索因此要十几秒才出结果）。
 
 ### 4.3 播放地址解析
 
 **平台在 2026-10-14 换了一次接口，而且是路径与请求体一起换。**当前可用的是：
+
+> **门槛是设备，不是登录态。** 未注册设备回 `101000 服务异常`；注册过的设备回 `code 0`。
+> 另外**只要 `device_id` 不在平台黑名单里**（内置那个第三方共用值被拉黑）随机值也能通过：
+> 服务端对播放的门槛比搜索松。但客户端**统一只用注册下发的那一对**签名，
+> 不再自己编随机身份（取播放地址之前会同步兜一次注册）——
+> 详见 [DEVICE_REGISTER.md](DEVICE_REGISTER.md) 第 5 节。
 
 ```
 POST https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/?<device + ts + _rticket>
@@ -704,6 +694,62 @@ Accept-Encoding: identity
 
 ---
 
+### 4.6 相关作品（详情页「相关作品」那一栏）
+
+App 详情页上「相关作品」那一栏不是官网页面给的，而是详情页自己拉的一个 cell：
+
+```
+GET https://{线路}/reading/bookapi/plan/v:version/
+    ?scene=10&from=detail_page_more_related&book_id={剧集 ID}
+    &<设备参数 + ts + _rticket>
+```
+
+- 线路：六条 `api5-normal-*`（`sinfonlinea/c/b`、`lf`、`lq`、`hl`），与搜索 / 弹幕同一套。
+  注意 `ads5-normal-*.zijieapi.com` **不认**这个接口（实测 0/6，一律空响应体）；
+- 鉴权：与其它 App 接口一样，**设备注册 + 签名**即可，不要求登录态；
+- `from` 必须正是 `detail_page_more_related`：换成 `detail_page` / `video_detail_page_module`
+  一律回空响应体；`scene=10` 之外的多余参数（`limit` / `offset` / `pad_column_detail` …）
+  实测不影响结果，给不给都一样。
+
+响应（`code == 0`）：
+
+```json
+{
+  "code": 0, "message": "SUCCESS",
+  "data": [
+    { "cell_id": 7511643039589220414, "show_type": 547, "cell_name": "相关作品",
+      "next_offset": 26, "has_more": false,
+      "video_data": [ { "series_id": "7628202881140657177", "title": "万妖图录传第二季",
+                        "cover": "…", "video_desc": "…", "episode_cnt": 53,
+                        "season_index": 2, "tag_info": { "text": "第2季" } } ] },
+    { "cell_id": 6975711477277655048, "show_type": 506, "cell_name": "猜你喜欢", "cell_data": [ … ] }
+  ]
+}
+```
+
+- 取 `show_type == 547`（或 `cell_name == "相关作品"`）那个 cell 的 `video_data[]`；
+- 每条的卡片字段与官网卡片同构（`series_id` / `title` / `cover` / `video_desc` / `episode_cnt`），
+  另外多两个平台自己算好的字段：
+  - `season_index`：这一部是第几季（没有季号的条目为 `null`）；
+  - `tag_info.text`：`第N季`（同一部剧的其它季）或 `同IP`（同 IP 的其它剧）。
+- **一次给全，不需要翻页**：`offset` / `limit` 被忽略，`next_offset` 就是条目总数、
+  `has_more` 恒为 `false`。实测：万妖图录传 26 条（13 季 + 13 部同 IP）、
+  聚宝仙盆 45 条、单季短剧 25 条。
+- 每个 `book_id` 的结果**与该剧是第几季无关**：查第一季、第二季、第十三季、未上线的
+  第十四季，回来的都是同一份 26 条（只是「自己」那一条是否出现在 `第N季` 组里会变）。
+
+> **空响应体是常态，而且与注册无关。** 这个接口实测约一半概率回
+> **HTTP 200 + 0 字节**（六条线路的成功率 2/6 ~ 4/6，同一线路连发亦然），
+> 与「设备没注册」那种空响应表现一致。因此客户端**换线重发**（最多 8 次、轮一圈线路），
+> 拿到 `code 0` 就返回；整轮失败才退回官网详情页的 `related_list`（3.4.1）。
+> 实测：一次请求约 0.4~1.1s（含重试），成功即拿到全部条目。
+
+> **别只看 `tag_info` 挑同系列。** `第N季` 那一组里混着同 IP 的**另一个系列**：
+> 万妖图录传第一季那页的 `第N季` 组里有「万妖图录传：月落镇魔第二季」，
+> 聚宝仙盆那页里也有「凡人修仙开局捡到聚宝仙鼎第二季」。
+> 因此客户端仍然用 `core/SeriesSeasons.normalize` 按**剧名**筛同系列
+>（剥季号 + 全角转半角 + 去标点后完全相同），`tag_info` 只当参考。
+
 ## 5. 媒体解密
 
 ### 5.1 播放地址解密 `MediaCrypto.decryptUrl`
@@ -749,12 +795,14 @@ key    = hex( ascii(work[1:33]) )        # 32 个十六进制字符 -> 16 字节
 榜单：GET /rank/hot-comic-drama?page=1           -> rankList + 名次/热度
 搜索：GET /reading/bookapi/search/tab/v          -> tab_type 11=短剧 / 19=漫剧，一次 20 条
         └─ 第 2 页起带上一页的 search_id / passback / next_offset（游标缺省即回到第 1 页重搜）
-        └─ 空响应体（匿名设备）/ 失败 -> GET /search/{kw}?page=1            （第 1 页）
+        └─ 空响应体（设备未注册）/ 失败 -> GET /search/{kw}?page=1           （第 1 页）
                                       -> GET /category/{comic|real}-drama?page=N 往后扫（第 2 页起）
 提示词：GET /incent_resource/suggestion?app_id=8662&query={kw}&count=10   （免签名、免登录）
         └─ 热搜词没有专门接口：并发问几个题材种子词，取「不是某部剧」的那些词（见 3.5.1.1）
 详情：GET /detail?series_id={id}                 -> seriesDetail + vid_list[]
-      └─ 同一份 HTML 的 mergeLoaderData 参数      -> recommendationGroups.related_list[]（相关短剧）
+相关：GET /reading/bookapi/plan/v:version/         -> 相关作品 cell（show_type=547）的 video_data[]
+      └─ scene=10&from=detail_page_more_related&book_id={id}；一次给全，空响应换线重发
+      └─ 整轮失败时退回同一份 HTML 的 mergeLoaderData -> recommendationGroups.related_list[]（相关短剧）
 播放：POST /novel/player/video_model/v1/          -> video_model.fallback_api（body 用 video_id 单值）
       └─ 兜底顺序：video_model → multi_video_model/{preload,default,detail}/ → multi_video_model/
       GET  {fallback_api}                        -> video_list + key_seed/spade_a
@@ -770,8 +818,8 @@ key    = hex( ascii(work[1:33]) )        # 32 个十六进制字符 -> 16 字节
 ./android/gradlew -p android --offline :core:run --args="--suggest 仙"
 ./android/gradlew -p android --offline :core:run --args="--hot"
 ./android/gradlew -p android --offline :core:run --args="--search 聚宝 --short"
-# 搜索探针带登录态（不带 token 时匿名请求会退回官网搜索 + 片库目录）
-./android/gradlew -p android --offline :core:run --args="--search 聚宝 --short --token <x-tt-token>"
+# 搜索探针：不带设备注册时退回官网搜索 + 片库目录
+./android/gradlew -p android --offline :core:run --args="--search 聚宝 --short"
 ./android/gradlew -p android --offline :core:run --args="--danmaku"
 
 # 默认探针：搜索 -> 首页 -> 详情 -> 播放地址 -> 分段读取（--save 落一份首段 MP4）
@@ -784,7 +832,7 @@ key    = hex( ascii(work[1:33]) )        # 32 个十六进制字符 -> 16 字节
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| App 搜索返回 HTTP 200 空 body | 平台对匿名设备关闭；必须判空后回退官网搜索，否则异常会打断兜底（配置 `x-tt-token` / `HONGGUO_SESSION_TOKEN` 后该接口可用） |
+| App 搜索返回 HTTP 200 空 body | **这台设备没在服务端注册**（不是登录问题）。空响应一次即判死、回退官网搜索，**不要原地重试**；注册协议见 [DEVICE_REGISTER.md](DEVICE_REGISTER.md) |
 | 官网搜索只有约 10 条、翻页无效 | 服务端忽略所有分页参数；App 搜索不可用时第 2 页起改用片库目录扫描 |
 | 提示词接口 500 | `app_id` 缺失或不是 `8662`；`query` 为空也会 500（两条都是实测） |
 | 漫剧搜索报 `A JSONObject text must begin with '{'` | 空 body 直接进 JSON 解析器；先判空即可 |
@@ -794,7 +842,8 @@ key    = hex( ascii(work[1:33]) )        # 32 个十六进制字符 -> 16 字节
 | 播放返回 200 而非 206 | CDN 不支持分段；必须按分段协议处理，否则解密与 seek 都不成立 |
 | 抓包拿不到有效数据 | App 有证书校验 + QUIC；需系统 CA + Frida 解 pinning，或直接挂钩 `SSL_write`/`SSL_read`，并注意响应是 brotli |
 | 签名请求被拒 | `_rticket` 必须落在 `branch == 0` 的分支上（本实现只发这一支） |
-| 播放接口 `HTTP 200 + 0 字节` | 网关在业务处理前挡掉了请求（路径 / 请求体形态已变）；**必须先判空再解析**，否则业务码会默认成 0、被当成成功 |
+| 播放接口 `HTTP 200 + 0 字节` | 两种成因：网关在业务处理前挡掉（路径 / 请求体形态已变），或 `device_id` 被拉黑。**必须先判空再解析**，否则业务码会默认成 0、被当成成功 |
+| 设备注册回 `device_id=0` | body 形态不对（**必须是原始二进制，不能发 base64 文本**）或 `os_version` 写成了数字；见 [DEVICE_REGISTER.md](DEVICE_REGISTER.md) 第 4 节 |
 | 播放接口 `100001 video_id invalid` | 新路由 `/novel/player/video_model/v1/` 要 `video_id` 单值，给 `mixed_video_id_map` / `vid` / `video_ids` / 数组都不行 |
 
 ---

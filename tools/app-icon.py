@@ -2,7 +2,7 @@
 """红果TV 的应用图标与电视横幅：一份几何、一套配色，出四份产物。
 
 图标是**扁平风格**的：苹果公司的 Apple 标志（果身 + 果叶）两块纯色——
-果身 `#EE4C33`、果叶 `#6E9F3E`，果叶上一条 `#3E6522` 的中脉，就这些；
+果身 `#EE4C33`、果叶 `#6E9F3E`（**一整块纯绿，叶面没有中脉**），就这些；
 底下**铺一层纯白不透明背景**。没有描边、没有圆角矩形、没有渐变、没有阴影与高光。
 
 2026-10-12 同一天改了两处（都按需求）：
@@ -12,6 +12,12 @@
 2. 整枚图标从拟物改扁平——原来那套径向渐变（迎光面 → 本色 → 背光边缘）、
    接触阴影、左上高光、右下环境反光，缩到 48dp 之后都只剩一两个像素的杂色，
    扁平色块反而更干净、更清楚。颜色沿用拟物版的本色，因此与旧版是同一个红、同一个绿。
+
+2026-10-16 按需求再去一处：**果叶上那条 `#3E6522` 的中脉删掉**，果叶变成一整块纯绿
+（`#6E9F3E`，与果身同样的实心色块）。扁平版里它是唯一的细节，但在桌面 48dp 上只剩一条
+深绿细丝，远看不像叶脉、倒像叶面上划了一道；位图与矢量两条渲染路径同时改——
+`render_master()` 只剩两块纯色填充（画中脉的 `line_mask()` 一并删掉），
+`vector_xml()` 只剩 2 条路径（果身 / 果叶各一条 `fillColor`，不再有 `strokeColor` 那条）。
 
 **为什么是白底而不是透明**（2026-10-12 改版，按需求）：透明底时图标在桌面上的观感
 完全由启动器决定，同一张图在不同设备上落成黑方块、深灰方块或直接贴壁纸，看起来像三个应用。
@@ -103,11 +109,11 @@ def font(size, bold=False):
 # ============ 调色板（扁平风格：纯色块，没有渐变与阴影） ============
 
 # 2026-10-12 第三次改版：图标整体换成扁平风格——果身与果叶各一个纯色块，
-# 只有果叶中脉一条稍深的细线，没有径向渐变、没有接触阴影、没有高光与反光。
+# 没有径向渐变、没有接触阴影、没有高光与反光。
+# 2026-10-16 按需求：果叶上那条中脉去掉，果叶就是上面这一个纯色（见文件头）。
 # 颜色沿用拟物版的本色，因此在桌面上与旧版是同一个红、同一个绿。
 FRUIT = (0xEE, 0x4C, 0x33)         # 果身：单色（旧版的「本色」）
-LEAF = (0x6E, 0x9F, 0x3E)          # 果叶：单色
-LEAF_VEIN = (0x3E, 0x65, 0x22)     # 果叶中脉：扁平风格里唯一的细节
+LEAF = (0x6E, 0x9F, 0x3E)          # 果叶：单色（一整块纯绿，叶面没有中脉）
 
 # 图标背景：纯白不透明。底板由图标自己给（见文件头），所有启动器上看到的是同一块白底。
 BG_WHITE = (0xFF, 0xFF, 0xFF)
@@ -305,10 +311,11 @@ def ramp(t, stops):
 
 
 def render_master():
-    """扁平渲染：果身与果叶各一块纯色，果叶上一条中脉。
+    """扁平渲染：果身与果叶各一块纯色——物件的全部内容就是这两块色。
 
     没有径向渐变、没有接触阴影、没有高光与反光——缩到桌面的 48dp 之后，
-    这些层次只剩一两个像素的杂色，扁平色块反而更清楚。
+    这些层次只剩一两个像素的杂色，扁平色块反而更清楚。果叶上的中脉 2026-10-16
+    按需求删掉（见文件头）：在 48dp 上它只是一条深绿细丝，不成叶脉。
     """
     N = MASTER
     k = N / UNIT
@@ -318,18 +325,6 @@ def render_master():
     def poly_mask(pts, dx=0.0, dy=0.0):
         m = Image.new("L", (N, N), 0)
         ImageDraw.Draw(m).polygon([((x + dx) * k, (y + dy) * k) for x, y in pts], fill=255)
-        return np.asarray(m, np.float32) / 255.0
-
-    def line_mask(a, b, width, n=64):
-        """一条圆头细线（中脉）：沿 a→b 采样一串圆点，扁平风格不需要抗锯齿以外的处理。"""
-        m = Image.new("L", (N, N), 0)
-        d = ImageDraw.Draw(m)
-        for i in range(n + 1):
-            t = i / n
-            cx = a[0] + (b[0] - a[0]) * t
-            cy = a[1] + (b[1] - a[1]) * t
-            r = width / 2.0
-            d.ellipse([(cx - r) * k, (cy - r) * k, (cx + r) * k, (cy + r) * k], fill=255)
         return np.asarray(m, np.float32) / 255.0
 
     m_body = poly_mask(BODY_PTS)
@@ -350,12 +345,8 @@ def render_master():
     # —— 1. 果身：一块纯色 ——
     over(FRUIT, m_body)
 
-    # —— 2. 果叶：一块纯色 + 中脉 ——
+    # —— 2. 果叶：一块纯色（叶面没有中脉，见文件头） ——
     over(LEAF, m_leaf)
-    lx0, ly0, lx1, ly1 = sub_bbox(LEAF_SEGS)
-    vein_a = (lx0 + (lx1 - lx0) * 0.14, ly1 - (ly1 - ly0) * 0.10)
-    vein_b = (lx1 - (lx1 - lx0) * 0.12, ly0 + (ly1 - ly0) * 0.10)
-    over(LEAF_VEIN, line_mask(vein_a, vein_b, 1.1) * m_leaf)
 
     return Image.fromarray(
         np.dstack([np.clip(rgb, 0, 255), np.clip(alpha * 255, 0, 255)]).astype(np.uint8), "RGBA")
@@ -418,21 +409,69 @@ def graphite_plate(w, h, center=(0.34, 0.5)):
     return Image.fromarray(col.astype(np.uint8), "RGB")
 
 
+def banner_font(d, text, avail, largest=110, smallest=64):
+    """横幅文字：从 [largest] 往下找第一个整行放得下的字号，返回（字体，墨迹包围盒）。
+
+    写死字号会随系统字体的落点变化而溢出卡片（同一句话在不同字号下宽度差一截），
+    因此按可用宽度自适应；[smallest] 只是兜底，真取到它说明布局参数被改坏了。
+    """
+    for size in range(largest, smallest - 1, -2):
+        f = font(size, bold=True)
+        box = d.textbbox((0, 0), text, font=f)
+        if box[2] - box[0] <= avail:
+            return f, box
+    f = font(smallest, bold=True)
+    return f, d.textbbox((0, 0), text, font=f)
+
+
+def banner_mark(height):
+    """横幅左侧的标志：**透明底**的红果，按可见内容裁紧后缩到 [height] 高。
+
+    透明底这一版直接取 [icon_image] 的透明输出（与桌面图标同一份几何、同一套色值），
+    再裁掉自适应图标安全区留下的空白、按高度等比缩放——因此物件本身就是图标那么大，
+    不再是「一块白底板里的一颗小苹果」。
+
+    为什么横幅用透明底、而桌面图标继续铺白底：图标的白底板是为了在各家启动器上底色一致
+    （见文件头），横幅自带石墨底，白底板在这里只会变成一块突兀的白方块。
+    """
+    src = icon_image(height * 2, transparent=True)      # 2 倍出图再缩，边缘干净
+    box = src.getbbox()
+    if box:
+        src = src.crop(box)
+    width = max(1, int(round(src.width * height / src.height)))
+    return src.resize((width, height), Image.LANCZOS)
+
+
 def banner_image():
+    """电视横幅（320×180dp，出图 640×360）：左边红果标志，右边「红果TV」。
+
+    2026-10-16 按需求两次重排，这一版是结果：
+
+    1. **标志用透明底**（见 [banner_mark]）：不再是一块白底板，直接压在石墨底上；
+    2. **标志尺寸收到卡片高度的 52%**：苹果本体约 187px 高。透明底之后苹果本身就是「图标那么大」，
+       58% 那一版在卡片里显得抢眼，52% 与右侧文字更配；
+    3. **「红果TV」用放得下的最大字号**（640 宽下约 106 号，墨迹约 99px 高）：写死字号会随系统
+       字体落点变化而溢出卡片，因此按可用宽度自适应；
+    4. **去掉文字下方的金线**：品牌色靠标志本身表达，文字下面不再压一条装饰线；
+    5. 左 / 右安全边距与标志、文字之间的间距按「整块 lockup 左右基本等距」重算，
+       文字墨迹中心与标志竖向中心都压在卡片中线上。
+    """
     w, h = BANNER
     img = graphite_plate(w, h).convert("RGBA")
-    mark_h = int(round(h * 0.60))
-    mark = icon_image(mark_h, 1.0)   # 横幅里的标志占满画布
-    img.alpha_composite(mark, (int(w * 0.10), (h - mark.height) // 2))
+    # 标志：苹果本体占卡片高度的 52%（宽高比固定，宽度由 banner_mark 按高度算出来）。
+    mark = banner_mark(int(round(h * 0.52)))
+    x = int(round(w * 0.0625))
+    img.alpha_composite(mark, (x, (h - mark.height) // 2))
     d = ImageDraw.Draw(img)
-    f = font(62, bold=True)
     text = "红果TV"
-    box = d.textbbox((0, 0), text, font=f)
-    tx = int(w * 0.47)
-    ty = int(h * 0.5 - (box[1] + box[3]) / 2.0) - 8
+    left = x + mark.width + int(round(w * 0.06))
+    avail = w - left - int(round(w * 0.06))
+    f, box = banner_font(d, text, avail)
+    ink_w, ink_h = box[2] - box[0], box[3] - box[1]
+    # 文字块在剩余宽度里居中，纵向墨迹中心压在卡片中线上（与标志同一条中线）。
+    tx = left + (avail - ink_w) // 2 - box[0]
+    ty = (h - ink_h) // 2 - box[1]
     d.text((tx, ty), text, font=f, fill=INK + (255,))
-    d.rounded_rectangle([tx + 3, ty + (box[3] - box[1]) + 26, tx + 171,
-                         ty + (box[3] - box[1]) + 30], radius=2, fill=ACCENT + (255,))
     return img.convert("RGB")
 
 
@@ -458,9 +497,6 @@ def vector_path(pd, fill, fill_type=None, indent=8):
 def vector_xml():
     body_d = path_d(BODY_SEGS)
     leaf_d = path_d(LEAF_SEGS)
-    lx0, ly0, lx1, ly1 = sub_bbox(LEAF_SEGS)
-    vein_a = (lx0 + (lx1 - lx0) * 0.14, ly1 - (ly1 - ly0) * 0.10)
-    vein_b = (lx1 - (lx1 - lx0) * 0.12, ly0 + (ly1 - ly0) * 0.10)
 
     L = []
     A = L.append
@@ -473,10 +509,11 @@ def vector_xml():
     A("  同一张图在不同设备上就不是一个颜色了；底板由图标自己给，前景保持透明，")
     A("  物件才能干净地压在底板上。")
     A("")
-    A("  物件的做法（2026-10-12 起）：果身 #EE4C33、果叶 #6E9F3E 两块纯色，果叶上一条 #3E6522")
-    A("  的中脉，就这些。拟物版那套径向渐变（迎光面 → 本色 → 背光边缘）、接触阴影、")
-    A("  左上高光与右下反光都删掉了——缩到桌面的 48dp 之后它们只剩一两个像素的杂色；")
-    A("  同版还去掉了果身正中那枚播放三角（同上原因）。")
+    A("  物件的做法（2026-10-12 起，2026-10-16 去掉果叶中脉）：果身 #EE4C33、果叶 #6E9F3E")
+    A("  两块纯色，就这些——果叶是一整块纯绿，叶面没有中脉。拟物版那套径向渐变")
+    A("  （迎光面 → 本色 → 背光边缘）、接触阴影、左上高光与右下反光都删掉了——")
+    A("  缩到桌面的 48dp 之后它们只剩一两个像素的杂色；同版还去掉了果身正中那枚播放三角")
+    A("  （同上原因），后来那条 #3E6522 的果叶中脉也一起去掉，位置同上。")
     A("")
     A("  外层 group 的 0.80 是自适应图标的安全区（在真机启动器上量过：108dp 画布只露出")
     A("  中央 72dp）：果身整个落在中央 66dp 的圆里（最远 31dp），果叶尖到 42dp，离 72dp")
@@ -490,12 +527,8 @@ def vector_xml():
       % (num2(ICON_SCALE), num2(ICON_SCALE)))
     # 1 果身：纯色
     A(vector_path(body_d, fill=hexc(FRUIT)))
-    # 2 果叶：纯色
+    # 2 果叶：纯色（一整块纯绿，没有中脉）
     A(vector_path(leaf_d, fill=hexc(LEAF)))
-    # 3 果叶中脉：一条稍深的线
-    A('        <path android:pathData="M%s,%s L%s,%s" android:strokeColor="%s" '
-      'android:strokeWidth="1.1" android:strokeLineCap="round"/>'
-      % (num(vein_a[0]), num(vein_a[1]), num(vein_b[0]), num(vein_b[1]), hexc(LEAF_VEIN)))
     A("    </group>")
     A("</vector>")
     return "\n".join(L) + "\n"

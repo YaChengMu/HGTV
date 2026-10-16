@@ -106,7 +106,8 @@ object LibraryDisk {
             ContentType.fromStored(values["contentType"] as? String), VideoFrameMode.fromStored(values["frameMode"] as? String),
             DanmakuMode.fromStored(values["danmakuMode"] as? String),
             DanmakuStyle.scale((values["danmakuScale"] as? Number)?.toFloat() ?: 1f),
-            DanmakuStyle.alpha((values["danmakuAlpha"] as? Number)?.toFloat() ?: 1f))
+            DanmakuStyle.alpha((values["danmakuAlpha"] as? Number)?.toFloat() ?: 1f),
+            DanmakuSpeed.fromStored(values["danmakuSpeed"] as? String))
         return LibraryIndex(BackupData(series("favorites"), history, ids("watched"),
             SearchHistory.decode(values["searches"] as? String ?: "[]"), settings, series("later"), ids("hidden")), updates)
     }

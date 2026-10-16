@@ -4,14 +4,15 @@ package com.hgtv.star.core
 /**
  * 剧名里的季号解析。
  *
- * 平台**没有**「分季」接口：详情页的 `seriesDetail` 里没有任何季 / 系列字段，
- * 页面上「相关短剧」那一栏（`recommendationGroups.related_list`）也是「看了这部还看什么」的推荐，
- * 不是同一部剧的其它季。能拿到同系列各季的入口只有一个：**用剧名去官网搜索**
- * （`GET /search/{关键词}`，实测搜基名时同一系列的各季都排在前 10 条里）。
+ * 同系列各季由 App 详情页的「相关作品」接口给出
+ * （`GET /reading/bookapi/plan/v:version/`，响应里 `show_type=547` 那个 cell 的
+ * `video_data[]`，每条都带平台自己的 `season_index`；见 `ContentRepository.related`）。
+ * 但**卡片上的季号标注、以及「这一部是第几季」的显示仍然只能从剧名读**：
+ * 首页 / 榜单 / 分类 / 搜索这些列表里没有 `season_index`，详情页只有当前这一季的那一个值。
  *
  * 因此这里做两件纯逻辑的事：
  *
- * 1. [base]：剥掉剧名尾部的季号，得到用来搜索的「基名」——
+ * 1. [base]：剥掉剧名尾部的季号，得到「基名」——
  *    `聚宝仙盆之杂灵根才是真BOSS第十三季` → `聚宝仙盆之杂灵根才是真BOSS`；
  * 2. [season]：取出季号，`第一季` / `第1季` / `S1` / `Season 1` 都算 1，没有季号算 1（第 1 季）。
  *
@@ -75,8 +76,9 @@ object SeriesSeasons {
     /**
      * 季号的两种写法：中文（`第十三季`，平台上剧名就是这么写的）与阿拉伯（`第13季`）。
      *
-     * 搜「第 N 季」比搜基名准得多：**换关键词就是换一批结果**（官网搜索一次只回 10 条、
-     * 忽略分页参数），因此客户端会沿着季号逐季搜过去，中文与阿拉伯两种写法各试一次。
+     * 同系列各季现在由「相关作品」接口直接给出（见 [ContentRepository.related]），
+     * 这里保留两种写法的互转：一是给测试做自洽性校验（生成的标签必须能被 [season] 认回来），
+     * 二是外部工具（`tools/`、联调脚本）按季号拼剧名时用得上。
      */
     fun labels(season: Int): List<String> = if(season<1 || season>99) emptyList()
         else listOf("第" + chinese(season) + "季","第" + season + "季")

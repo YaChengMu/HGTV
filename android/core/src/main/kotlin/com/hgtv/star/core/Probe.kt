@@ -123,7 +123,7 @@ fun main(args: Array<String>) {
             val detailMs=System.currentTimeMillis()-started
             println("detail=${detail.series.title}; episodes=${detail.episodes.size}; ${detailMs}ms（不含相关剧集）")
             val relatedStart=System.currentTimeMillis()
-            val works=repository.related(seriesId)
+            val works=repository.related(seriesId,detail.series.title)
             val relatedMs=System.currentTimeMillis()-relatedStart
             println("related 共 ${works.items.size} 条，${relatedMs}ms")
             works.items.take(14).forEach { println("   ${it.id} ${it.title} | ${it.badge} | 第 ${SeriesSeasons.season(it.title)} 季") }
@@ -135,8 +135,8 @@ fun main(args: Array<String>) {
             check(works.items.take(works.seasons.size).map { it.id }==works.seasons.map { it.id }) { "同系列没有排在前面" }
             // 第二次取（界面重复点开）应当命中缓存、几乎不花时间。
             val againStart=System.currentTimeMillis()
-            val again=repository.related(seriesId)
-            println("再取一次 ${System.currentTimeMillis()-againStart}ms（同系列走缓存）；条数一致=${again.items.size==works.items.size}")
+            val again=repository.related(seriesId,detail.series.title)
+            println("再取一次 ${System.currentTimeMillis()-againStart}ms（再发一次接口请求）；条数一致=${again.items.size==works.items.size}")
             println("同系列 ${works.seasons.size} 季：${works.seasons.joinToString("、") { it.title }}")
         } finally {
             repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown()
