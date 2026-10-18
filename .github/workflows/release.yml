@@ -1,16 +1,18 @@
 name: Release Android TV APK
 
-# 每次推送到 main：把本次的 versionName / versionCode 与**上一次发布的 tag**比较
-# （不是「上一个提交」——中间夹了多少次不升版本的普通推送都不影响基线）。
+# **只允许手动触发**：推送到 main 不再自动打包发布。
+#
+# 为什么改成手动：发布是「对外发版」这个动作，不应该由一次普通推送顺带完成；
+# 什么时候发、发哪个版本，由维护者在 Actions 页面点一次 Run workflow 决定。
+#
+# 手动触发时把本次的 versionName / versionCode 与**上一次发布的 tag**比较：
 #   两个都**严格大于**基准 → 打包并发布 Release（tag = v<版本号>）
-#   两个都与基准相同      → 跳过，不打包（只改代码没升版本的普通推送）
+#   两个都与基准相同      → 跳过，不打包
 #   其余（只升一个 / 降了）→ 失败，提示版本必须同时增大
 # 基准取自 HEAD 上最近的 `v*` tag；一个都没有时回落到上一个提交。
 # 比对规则在 tools/compare-version.sh，本地可单独跑（用法见该脚本头部）。
-# 手动触发时可选 force=true，跳过比对直接发布当前版本（补发失败 Release 用）。
+# 可选 force=true，跳过比对直接发布当前版本（补发失败 Release 用）。
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       force:
@@ -65,10 +67,9 @@ jobs:
           echo "min_sdk=$min_sdk" >> "$GITHUB_OUTPUT"
           echo "本次提交：versionName=$version versionCode=$code minSdk=$min_sdk 产物=$apk"
 
-      - name: 与上一个提交对比
+      - name: 与上一次发布对比
         id: diff
         env:
-          BEFORE_SHA: ${{ github.event.before }}
           GRADLE_FILE: android/app/build.gradle.kts
         run: |
           set -euo pipefail
@@ -86,18 +87,15 @@ jobs:
           # 更早的版本上，导致「已经发过的版本」被判成需要再发一次。
           previous="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)"
           if [ -z "$previous" ]; then
-            # 一个发布 tag 都没有：回落到「上一次推送前的提交」，再退到 HEAD~1。
-            if [ -n "${BEFORE_SHA:-}" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
-               && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-              previous="$BEFORE_SHA"
-              echo "没有发布 tag，回落到上一个提交作为基准。"
-            elif git rev-parse --verify -q HEAD~1 >/dev/null; then
+            # 一个发布 tag 都没有：回落到 HEAD~1。手动触发没有「上一次推送」这个概念，
+            # 因此不再读 BEFORE_SHA。
+            if git rev-parse --verify -q HEAD~1 >/dev/null; then
               previous="$(git rev-parse HEAD~1)"
               echo "没有发布 tag，回落到 HEAD~1 作为基准。"
             fi
           fi
           if [ -z "$previous" ]; then
-            echo "没有可比对的历史（首次推送），视为版本已变动。"
+            echo "没有可比对的历史（仓库首个提交），视为版本已变动。"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
