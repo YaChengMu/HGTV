@@ -18,8 +18,8 @@ android {
         // 代价：Google Play 要求 34+，本应用是自签分发、不进 Play，不受影响。
         targetSdk = 29
         multiDexEnabled = true
-        versionCode = System.getenv("HGTV_VERSION_CODE")?.toInt() ?: 53
-        versionName = System.getenv("HGTV_VERSION_NAME") ?: "1.2.0.1"
+        versionCode = System.getenv("HGTV_VERSION_CODE")?.toInt() ?: 59
+        versionName = System.getenv("HGTV_VERSION_NAME") ?: "1.2.4"
     }
     buildFeatures { buildConfig = true }
     signingConfigs {
@@ -81,6 +81,8 @@ dependencies {
     implementation(project(":core")) { exclude(group = "org.json") }
     implementation("com.google.android.exoplayer:exoplayer-core:2.19.1")
     implementation("com.google.android.exoplayer:exoplayer-ui:2.19.1")
+    // 友盟：统计 + APM（崩溃 / ANR / 性能）。`common` 与 `asms` 用 `+` 是官方建议的写法，
+    // `apm` 钉版本（1.9.13 是本项目验证过的那一版）。
     implementation("com.umeng.umsdk:common:+")
     implementation("com.umeng.umsdk:asms:+")
     implementation("com.umeng.umsdk:apm:1.9.13")
